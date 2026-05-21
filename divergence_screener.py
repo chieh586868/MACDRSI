@@ -38,7 +38,7 @@ app.config["JSON_SORT_KEYS"] = False
 
 # ── 設定 ──────────────────────────────────────────────────
 PORT             = 5001
-SCAN_WORKERS     = 30
+SCAN_WORKERS     = 8     # ★ 4 核心 CPU 最佳值約 6-8；過多反而 GIL 競爭
 YF_PARALLEL_BATCHES = 6           # ★ 預載時並行批次數
 HIST_TTL         = 86400 * 3
 FULL_LIST_FILE   = "tw_stocks.json"
@@ -362,45 +362,65 @@ def calc_ind(closes, highs, lows, volumes):
     return ind
 
 
-# ── 背離偵測（★ pivot 使用 numba）────────────────────────
+# ── 背離偵測（★ pivot 使用 numba；★ 跳過無必要的 NaN 填補）──
 def detect_div(price, indicator, lookback=120, min_gap=4, max_bars=15):
     r = {"regular_bull": False, "hidden_bull": False, "detail": ""}
-    lb = min(lookback, len(price))
+    n_total = len(price)
+    lb = lookback if lookback < n_total else n_total
     if lb < 15:
         return r
-    ps = price.iloc[-lb:].ffill().bfill().fillna(0)
-    is_ = indicator.iloc[-lb:].ffill().bfill().fillna(0)
-    pv = ps.values.astype(np.float64)
-    iv = is_.values.astype(np.float64)
+
+    # ★ 直接拿 numpy view，跳過 pandas .iloc 開銷
+    pv_full = price.values
+    iv_full = indicator.values
+    pv = pv_full[-lb:]
+    iv = iv_full[-lb:]
+
+    # ★ 多數股票沒 NaN，先檢查再決定要不要做 ffill/bfill/fillna
+    if np.isnan(pv).any():
+        pv = pd.Series(pv).ffill().bfill().fillna(0).values
+    if np.isnan(iv).any():
+        iv = pd.Series(iv).ffill().bfill().fillna(0).values
+
+    # 確保是 float64（numba 要求）
+    if pv.dtype != np.float64:
+        pv = pv.astype(np.float64)
+    if iv.dtype != np.float64:
+        iv = iv.astype(np.float64)
+
     pp = find_pivot_lows_nb(pv, 3, 3)
     ip = find_pivot_lows_nb(iv, 3, 3)
     if len(pp) < 2 or len(ip) < 2:
         return r
     n = len(pv)
     p1 = int(pp[-1])
-    p2 = None
-    for x in pp[:-1][::-1]:
-        if p1 - x >= min_gap:
-            p2 = int(x); break
-    if p2 is None:
-        return r
-    sr = 6
-    ip_list = ip.tolist()
 
+    # 早退：如果最新 pivot 太遠就不用算
+    bars = n - 1 - p1
+    if bars > max_bars:
+        return r
+
+    p2 = -1
+    for k in range(len(pp) - 2, -1, -1):
+        if p1 - pp[k] >= min_gap:
+            p2 = int(pp[k]); break
+    if p2 < 0:
+        return r
+
+    sr = 6
+    # 不轉 ip.tolist()，直接在 numpy array 上找 nearest
     def ni(pi):
-        best = None
-        for x in ip_list:
-            if abs(x - pi) <= sr:
-                if best is None or abs(x - pi) < abs(best - pi):
-                    best = x
-        return best if best is not None else pi
+        best = pi
+        best_d = sr + 1
+        for x in ip:
+            d = x - pi if x >= pi else pi - x
+            if d <= sr and d < best_d:
+                best = int(x); best_d = d
+        return best
     i1, i2 = ni(p1), ni(p2)
     vp1, vp2 = float(pv[p1]), float(pv[p2])
     vi1, vi2 = float(iv[i1]), float(iv[i2])
-    if any(v != v for v in [vp1, vp2, vi1, vi2]):
-        return r
-    bars = n - 1 - p1
-    if bars > max_bars:
+    if vp1 != vp1 or vp2 != vp2 or vi1 != vi1 or vi2 != vi2:
         return r
     if vp1 < vp2 and vi1 > vi2:
         r["regular_bull"] = True
