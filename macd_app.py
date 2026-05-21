@@ -1,0 +1,1848 @@
+"""
+================================================================
+MACD 盤中即時選股系統 - Flask 後端（極速版 v2）
+================================================================
+基於原速度優化版進一步加速：
+  ★ 新增 1：numba JIT 編譯 UT Bot trail / pivot 偵測（10-50x）
+  ★ 新增 2：eval_strategies / calc_confirm_score 預擷取 numpy（去除 .iloc 開銷）
+  ★ 新增 3：analyze_stock 移除 pd.concat 單列附加（改用 numpy append）
+  ★ 新增 4：fetch_history_batch 批次平行而非分組序列
+  ★ 新增 5：batch_scan_all 預先批次下載所有歷史，再丟給 worker
+  ★ 新增 6：sanitize 改非遞迴，並啟動時 numba 預編譯
+================================================================
+"""
+
+from flask import Flask, jsonify, render_template_string, request
+from flask_cors import CORS
+import requests
+import pandas as pd
+import numpy as np
+import json, time, threading, os
+from datetime import datetime, date, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("peewee").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore")
+import yfinance as yf
+from williams_v4 import calc_williams_signals_v4
+
+# ── 速度優化：numba JIT 共用函式 ──────────────────────────
+from fast_indicators import (
+    ut_bot_trail, ut_bot_trend,
+    find_pivot_lows_nb, find_pivot_highs_nb,
+    warmup as fast_warmup,
+)
+
+app = Flask(__name__)
+CORS(app)
+
+app.config["JSON_SORT_KEYS"] = False
+try:
+    app.json.ensure_ascii = False
+except Exception:
+    pass
+
+
+def sanitize(obj):
+    """非遞迴清洗（用 stack 取代遞迴，省下大量 call frame 開銷）"""
+    if isinstance(obj, (dict, list)):
+        # 走訪所有節點原地修改
+        stack = [obj]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    if isinstance(v, float):
+                        if v != v or v == float("inf") or v == float("-inf"):
+                            cur[k] = 0.0
+                    elif isinstance(v, (dict, list)):
+                        stack.append(v)
+            else:  # list
+                for i, v in enumerate(cur):
+                    if isinstance(v, float):
+                        if v != v or v == float("inf") or v == float("-inf"):
+                            cur[i] = 0.0
+                    elif isinstance(v, (dict, list)):
+                        stack.append(v)
+        return obj
+    if isinstance(obj, float):
+        if obj != obj or obj == float("inf") or obj == float("-inf"):
+            return 0.0
+    return obj
+
+# ══════════════════════════════════════════════════════════
+# ▌ 全局常數與設定
+# ══════════════════════════════════════════════════════════
+HIST_CACHE_FILE = "hist_cache.pkl"
+SCAN_CACHE_FILE = "scan_cache.pkl"
+FULL_LIST_FILE  = "tw_stocks.json"
+WATCHLIST2_FILE = "watchlist2.json"
+
+YF_BATCH_SIZE   = 50
+SCAN_WORKERS    = 40
+YF_PARALLEL_BATCHES = 4         # ★ 新增：同組內幾批可同時下載
+SJ_KBARS_SEM    = threading.Semaphore(5)
+
+_global_executor = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+# ★ 新增：給 yfinance 批次下載用的獨立 Pool，避免阻塞 scan workers
+_yf_executor = ThreadPoolExecutor(max_workers=YF_PARALLEL_BATCHES * 2)
+
+# ══════════════════════════════════════════════════════════
+# ▌ 股票清單
+# ══════════════════════════════════════════════════════════
+DEFAULT_WATCHLIST = [
+    {"id": "2330", "name": "台積電",   "ex": "tse"},
+    {"id": "2317", "name": "鴻海",     "ex": "tse"},
+    {"id": "2454", "name": "聯發科",   "ex": "tse"},
+    {"id": "2881", "name": "富邦金",   "ex": "tse"},
+    {"id": "2882", "name": "國泰金",   "ex": "tse"},
+    {"id": "2891", "name": "中信金",   "ex": "tse"},
+    {"id": "2303", "name": "聯電",     "ex": "tse"},
+    {"id": "3711", "name": "日月光",   "ex": "tse"},
+    {"id": "2382", "name": "廣達",     "ex": "tse"},
+    {"id": "2308", "name": "台達電",   "ex": "tse"},
+    {"id": "2412", "name": "中華電",   "ex": "tse"},
+    {"id": "2002", "name": "中鋼",     "ex": "tse"},
+]
+
+full_stock_list  = []
+full_list_loaded = False
+full_list_lock   = threading.Lock()
+watchlist        = list(DEFAULT_WATCHLIST)
+cache            = {}
+cache_lock       = threading.Lock()
+
+# ══════════════════════════════════════════════════════════
+# ▌ 歷史快取
+# ══════════════════════════════════════════════════════════
+hist_cache      = {}
+hist_cache_lock = threading.Lock()
+HIST_TTL        = 86400 * 3
+
+def _hist_key(stock_id: str, period: str, ex: str) -> str:
+    return f"{stock_id}_{period}_{ex}"
+
+def _get_hist_cache(key: str):
+    with hist_cache_lock:
+        entry = hist_cache.get(key)
+    if entry and (time.time() - entry["ts"]) < HIST_TTL:
+        return entry["df"]
+    return None
+
+def _set_hist_cache(key: str, df: pd.DataFrame):
+    with hist_cache_lock:
+        hist_cache[key] = {"df": df, "ts": time.time()}
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ yfinance 批量下載（★ 改為批次平行，TSE/OTC + 多批同時）
+# ══════════════════════════════════════════════════════════
+def fetch_history_batch(stocks: list, period: str = "3mo") -> dict:
+    need_download = []
+    result = {}
+
+    for s in stocks:
+        sid = s["id"]
+        ex  = s.get("ex", "tse")
+        key = _hist_key(sid, period, ex)
+        cached_df = _get_hist_cache(key)
+        if cached_df is not None and len(cached_df) >= 10:
+            result[sid] = cached_df
+        else:
+            need_download.append(s)
+
+    if not need_download:
+        return result
+
+    def _download_one_batch(batch, suffix, ex_name):
+        sub = {}
+        tickers_str = " ".join(f"{s['id']}{suffix}" for s in batch)
+        try:
+            raw = yf.download(
+                tickers_str, period=period, group_by="ticker",
+                progress=False, auto_adjust=True, threads=True,
+            )
+            single = len(batch) == 1
+            cols0 = None if single else raw.columns.get_level_values(0)
+            for s in batch:
+                sid = s["id"]
+                ticker = f"{sid}{suffix}"
+                try:
+                    if single:
+                        df = raw
+                    elif ticker in cols0:
+                        df = raw[ticker]
+                    else:
+                        continue
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df = df.dropna()
+                    if len(df) >= 10:
+                        sub[sid] = df
+                        _set_hist_cache(_hist_key(sid, period, ex_name), df)
+                except Exception:
+                    pass
+        except Exception as e:
+            # 批次失敗時改單支
+            for s in batch:
+                sid = s["id"]
+                if sid in sub:
+                    continue
+                try:
+                    df = yf.download(f"{sid}{suffix}", period=period,
+                                     progress=False, auto_adjust=True)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df = df.dropna()
+                    if len(df) >= 10:
+                        sub[sid] = df
+                        _set_hist_cache(_hist_key(sid, period, ex_name), df)
+                except Exception:
+                    pass
+        return sub
+
+    # ★ 全部批次（TSE+OTC 混合）一起平行
+    tasks = []
+    tse_stocks = [s for s in need_download if s.get("ex", "tse") == "tse"]
+    otc_stocks = [s for s in need_download if s.get("ex", "tse") == "otc"]
+    for batch_start in range(0, len(tse_stocks), YF_BATCH_SIZE):
+        tasks.append((tse_stocks[batch_start:batch_start + YF_BATCH_SIZE], ".TW", "tse"))
+    for batch_start in range(0, len(otc_stocks), YF_BATCH_SIZE):
+        tasks.append((otc_stocks[batch_start:batch_start + YF_BATCH_SIZE], ".TWO", "otc"))
+
+    futures = [_yf_executor.submit(_download_one_batch, b, suf, ex) for b, suf, ex in tasks]
+    for f in as_completed(futures):
+        try:
+            result.update(f.result())
+        except Exception:
+            pass
+    return result
+
+
+# ★ 下市/無資料黑名單
+_delisted_set: set = set()
+_delisted_lock = threading.Lock()
+DELISTED_FILE = "delisted_cache.json"
+
+def _load_delisted():
+    global _delisted_set
+    try:
+        if os.path.exists(DELISTED_FILE):
+            with open(DELISTED_FILE, "r") as f:
+                _delisted_set = set(json.load(f))
+            print(f"  📋 已知下市/無資料股票：{len(_delisted_set)} 支（略過）")
+    except Exception:
+        pass
+
+def _save_delisted():
+    try:
+        with _delisted_lock:
+            data = list(_delisted_set)
+        with open(DELISTED_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def _mark_delisted(sid: str):
+    with _delisted_lock:
+        _delisted_set.add(sid)
+
+
+def fetch_history(stock_id: str, period: str = "3mo", ex: str = "tse") -> pd.DataFrame:
+    with _delisted_lock:
+        if stock_id in _delisted_set:
+            return pd.DataFrame()
+
+    key = _hist_key(stock_id, period, ex)
+    cached_df = _get_hist_cache(key)
+    if cached_df is not None and len(cached_df) >= 10:
+        return cached_df
+
+    suffixes = [".TWO", ".TW"] if ex == "otc" else [".TW", ".TWO"]
+    for suffix in suffixes:
+        try:
+            df = yf.download(f"{stock_id}{suffix}", period=period,
+                             progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            if len(df) >= 10:
+                _set_hist_cache(key, df)
+                return df
+        except Exception:
+            continue
+
+    _mark_delisted(stock_id)
+    return pd.DataFrame()
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 啟動時批量預熱快取
+# ══════════════════════════════════════════════════════════
+preload_done = False
+preload_lock = threading.Lock()
+
+def warm_up_cache():
+    global preload_done
+    with preload_lock:
+        if preload_done:
+            return
+
+    if _load_hist_cache_disk():
+        preload_done = True
+        print(f"  ✅ 歷史快取從磁碟載入完成（{len(hist_cache)} 檔）")
+        return
+
+    stocks = list(watchlist)
+    total  = len(stocks)
+    print(f"\n  🔄 批量預熱歷史快取（{total} 支）...")
+    t0 = time.time()
+
+    downloaded = fetch_history_batch(stocks, period="3mo")
+    elapsed = round(time.time() - t0, 1)
+    print(f"  ✅ 批量下載完成：{len(downloaded)}/{total} 支，耗時 {elapsed} 秒")
+
+    _save_hist_cache_disk()
+    preload_done = True
+
+
+def _save_hist_cache_disk():
+    try:
+        import pickle
+        with hist_cache_lock:
+            data = dict(hist_cache)
+        # ★ 用 protocol=4 + 較高效的二進位
+        with open(HIST_CACHE_FILE, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  💾 歷史快取存檔（{len(data)} 檔）")
+    except Exception as e:
+        print(f"  ⚠ 快取存檔失敗: {e}")
+
+
+def _load_hist_cache_disk() -> bool:
+    global hist_cache
+    try:
+        import pickle
+        if not os.path.exists(HIST_CACHE_FILE):
+            return False
+        mtime = os.path.getmtime(HIST_CACHE_FILE)
+        if (time.time() - mtime) >= HIST_TTL:
+            return False
+        with open(HIST_CACHE_FILE, "rb") as f:
+            data = pickle.load(f)
+        if len(data) < 100:
+            return False
+        with hist_cache_lock:
+            hist_cache.update(data)
+        return True
+    except Exception as e:
+        print(f"  ⚠ 快取載入失敗: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 一次計算所有技術指標（★ UT Bot 改 numba JIT）
+# ══════════════════════════════════════════════════════════
+def calc_all_indicators(closes: pd.Series, highs: pd.Series,
+                         lows: pd.Series, volumes: pd.Series) -> dict:
+    ind = {}
+    n   = len(closes)
+    idx = closes.index
+
+    # ── MACD ──────────────────────────────────────────────
+    ema12 = closes.ewm(span=12, adjust=False).mean()
+    ema26 = closes.ewm(span=26, adjust=False).mean()
+    dif   = ema12 - ema26
+    dea   = dif.ewm(span=9, adjust=False).mean()
+    ind["dif"]  = dif
+    ind["dea"]  = dea
+    ind["hist"] = (dif - dea) * 2
+
+    # ── RSI(14) ───────────────────────────────────────────
+    delta = closes.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    ind["rsi"] = 100 - (100 / (1 + rs))
+
+    # ── KD(9,3,3) ────────────────────────────────────────
+    low_n  = lows.rolling(9).min()
+    high_n = highs.rolling(9).max()
+    rsv    = (closes - low_n) / (high_n - low_n + 1e-9) * 100
+    ind["K"] = rsv.ewm(com=2, adjust=False).mean()
+    ind["D"] = ind["K"].ewm(com=2, adjust=False).mean()
+
+    # ── 均線 ─────────────────────────────────────────────
+    for p in [5, 10, 20, 60]:
+        ind[f"ma{p}"] = closes.ewm(span=p, adjust=False).mean()
+
+    # ── 成交量均量 ────────────────────────────────────────
+    ind["vol_ma5"]   = volumes.rolling(5).mean()
+    ind["vol_ratio"] = volumes / ind["vol_ma5"].replace(0, np.nan)
+
+    # ── OBV ──────────────────────────────────────────────
+    direction    = np.sign(closes.diff()).fillna(0)
+    ind["obv"]   = (direction * volumes).cumsum()
+    ind["obv_ma"] = ind["obv"].rolling(10).mean()
+
+    # ── Bollinger(20,2) ──────────────────────────────────
+    bb_mid = closes.rolling(20).mean()
+    bb_std = closes.rolling(20).std()
+    ind["bb_upper"] = bb_mid + bb_std * 2
+    ind["bb_mid"]   = bb_mid
+    ind["bb_lower"] = bb_mid - bb_std * 2
+
+    # ── UT Bot（★ numba 加速）──────────────────────────
+    try:
+        atr_period = 1
+        key_value  = 3.0
+        prev_close = closes.shift(1)
+        tr = pd.concat([
+            highs - lows,
+            (highs - prev_close).abs(),
+            (lows  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr      = tr.ewm(span=atr_period, adjust=False).mean()
+        loss_thr = (key_value * atr).values.astype(np.float64)
+        c_arr    = closes.values.astype(np.float64)
+        trail_arr = ut_bot_trail(c_arr, loss_thr)
+        ut_t      = ut_bot_trend(c_arr, trail_arr)
+
+        trail_s = pd.Series(trail_arr, index=idx)
+        ind["ut_trail"] = trail_s
+        ind["ut_buy"]   = (closes > trail_s) & (closes.shift(1) <= trail_s.shift(1))
+        ind["ut_sell"]  = (closes < trail_s) & (closes.shift(1) >= trail_s.shift(1))
+        ind["ut_trend"] = pd.Series(ut_t, index=idx)
+    except Exception:
+        ind["ut_trail"] = closes * 0
+        ind["ut_buy"]   = pd.Series(False, index=idx)
+        ind["ut_sell"]  = pd.Series(False, index=idx)
+        ind["ut_trend"] = pd.Series(0, index=idx)
+
+    # ── Williams %R(20) ──────────────────────────────────
+    high20 = highs.rolling(20).max()
+    low20  = lows.rolling(20).min()
+    ind["wr"] = (high20 - closes) / (high20 - low20 + 1e-9) * -100
+
+    return ind
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 兼容用單一指標函式
+# ══════════════════════════════════════════════════════════
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def calc_macd(closes, fast=12, slow=26, signal=9):
+    ef = closes.ewm(span=fast, adjust=False).mean()
+    es = closes.ewm(span=slow, adjust=False).mean()
+    dif = ef - es
+    dea = dif.ewm(span=signal, adjust=False).mean()
+    return dif, dea, (dif - dea) * 2
+
+def calc_rsi(closes, period=14):
+    delta = closes.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def calc_kd(highs, lows, closes, period=9, k_smooth=3, d_smooth=3):
+    low_n  = lows.rolling(period).min()
+    high_n = highs.rolling(period).max()
+    rsv = (closes - low_n) / (high_n - low_n + 1e-9) * 100
+    K   = rsv.ewm(com=k_smooth-1, adjust=False).mean()
+    D   = K.ewm(com=d_smooth-1,   adjust=False).mean()
+    return K, D
+
+def calc_obv(closes, volumes):
+    return (np.sign(closes.diff()).fillna(0) * volumes).cumsum()
+
+def calc_bollinger(closes, period=20, std_mult=2):
+    mid = closes.rolling(period).mean()
+    std = closes.rolling(period).std()
+    return mid + std * std_mult, mid, mid - std * std_mult
+
+def calc_williams_r(highs, lows, closes, period=20):
+    h = highs.rolling(period).max()
+    l = lows.rolling(period).min()
+    return (h - closes) / (h - l + 1e-9) * -100
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 策略評估（★ 預擷取 numpy 純量，避免重複 .iloc）
+# ══════════════════════════════════════════════════════════
+def _last_scalar(s, default=0.0):
+    try:
+        v = s.values[-1]
+        return default if v != v else float(v)
+    except Exception:
+        return default
+
+def eval_strategies(ind: dict, closes: pd.Series, volumes: pd.Series) -> list:
+    if len(closes) < 3:
+        return []
+
+    # ★ 一次性把所有需要的尾端純量轉成 float
+    dif_v  = ind["dif"].values
+    dea_v  = ind["dea"].values
+    hist_v = ind["hist"].values
+    c_v    = closes.values
+    d0, d1 = float(dif_v[-1]),  float(dif_v[-2])
+    e0, e1 = float(dea_v[-1]),  float(dea_v[-2])
+    h0, h1 = float(hist_v[-1]), float(hist_v[-2])
+    h2     = float(hist_v[-3]) if len(hist_v) > 2 else h1
+    c0     = float(c_v[-1])
+
+    ma5  = _last_scalar(ind["ma5"])
+    ma10 = _last_scalar(ind["ma10"])
+    ma20 = _last_scalar(ind["ma20"])
+    ma60 = _last_scalar(ind["ma60"], ma20) if "ma60" in ind else ma20
+
+    vr_v = ind["vol_ratio"].values
+    vol_ratio = float(vr_v[-1]) if vr_v[-1] == vr_v[-1] else 1.0
+    vol_ok    = vol_ratio >= 1.2
+
+    golden = (d0 > e0) and (d1 <= e1)
+    dead   = (d0 < e0) and (d1 >= e1)
+    above_zero = d0 > 0 and e0 > 0
+    below_zero = d0 < 0 and e0 < 0
+
+    rsi_v = ind["rsi"].values
+    rsi_now = float(rsi_v[-1]) if rsi_v[-1] == rsi_v[-1] else 50.0
+
+    if len(c_v) >= 65:
+        ma60_v = ind["ma60"].values
+        ma60_slope = float(ma60_v[-1] - ma60_v[-5])
+    else:
+        ma60_slope = 0.0
+
+    triggered = []
+
+    # S1 底部黃金交叉
+    if golden and below_zero and h0 > 0 and vol_ok and 25 <= rsi_now <= 55 \
+       and (ma60_slope >= 0 or c0 > ma60 * 0.95):
+        triggered.append({"id": "S1", "name": "底部黃金交叉", "color": "#FFD700", "priority": 4,
+            "desc": f"零軸下DIF上穿DEA，量比{vol_ratio:.1f}x RSI={rsi_now:.0f}"})
+
+    # S2 零軸動能擴張
+    if above_zero and h0 > 0 and h0 > h1 and c0 > ma10 and c0 > ma20 \
+       and rsi_now < 68 and ma60_slope > 0 and vol_ratio >= 1.0 and c0 > ma60:
+        triggered.append({"id": "S2", "name": "零軸動能擴張", "color": "#00E5FF", "priority": 2,
+            "desc": f"紅柱擴張+MA60向上，RSI={rsi_now:.0f}，站MA20={ma20:.1f}"})
+
+    # S3 底背離
+    if len(c_v) >= 30:
+        nw = 30
+        prev_low_p = float(c_v[-nw:].min())
+        prev_low_d = float(dif_v[-nw:].min())
+        if c0 <= prev_low_p * 1.002 and d0 > prev_low_d * 0.9 and d0 < 0 and golden:
+            triggered.append({"id": "S3", "name": "底背離反轉", "color": "#CE93D8", "priority": 3,
+                "desc": "價格新低但MACD未創低，已黃金交叉確認"})
+
+    # S4 多週期共振
+    weekly_bull = above_zero
+    if weekly_bull and golden and vol_ok:
+        triggered.append({"id": "S4", "name": "多週期共振", "color": "#FF1744", "priority": 5,
+            "desc": f"週線+日線同向多頭，量比{vol_ratio:.1f}x"})
+
+    # S5 柱縮量進場
+    shrink1 = h1 > 0 and h1 < h2
+    expand  = h0 > 0 and h0 > h1
+    high5   = float(c_v[-6:-1].max()) if len(c_v) >= 6 else c0
+    if shrink1 and expand and c0 > ma20 and d0 > e0 \
+       and vol_ratio >= 1.5 and c0 >= high5 * 0.995 and rsi_now >= 45 and c0 > ma60:
+        triggered.append({"id": "S5", "name": "柱縮量進場", "color": "#69F0AE", "priority": 2,
+            "desc": f"紅柱縮後放量{vol_ratio:.1f}x突破前高，RSI={rsi_now:.0f}"})
+
+    # S6 強勢股回測
+    if len(c_v) >= 20:
+        prev_high = float(c_v[-20:-1].max())
+        breakout  = float(c_v[-6:-1].max()) > prev_high * 0.98
+        pullback  = ma10 * 0.97 <= c0 <= ma10 * 1.02
+        if breakout and pullback and not dead and above_zero and h0 > 0:
+            triggered.append({"id": "S6", "name": "強勢股回測", "color": "#FF9800", "priority": 3,
+                "desc": f"突破後回踩MA10={ma10:.1f}，MACD未死叉"})
+
+    return sorted(triggered, key=lambda x: -x["priority"])
+
+
+def calc_confirm_score(ind: dict, closes: pd.Series, volumes: pd.Series) -> dict:
+    score   = 0
+    details = {}
+    try:
+        c_v   = closes.values
+        c0    = float(c_v[-1])
+        ma5   = _last_scalar(ind["ma5"])
+        ma10  = _last_scalar(ind["ma10"])
+        ma20  = _last_scalar(ind["ma20"])
+        ma60  = _last_scalar(ind["ma60"], ma20) if len(c_v) >= 60 else ma20
+
+        # 均線
+        if ma5 > ma10 > ma20 > ma60:
+            score += 2
+            details["均線"] = {"status": "完整多頭排列", "score": 2, "pass": True,
+                               "detail": f"MA5{ma5:.1f}>MA10{ma10:.1f}>MA20{ma20:.1f}>MA60{ma60:.1f}"}
+        elif ma5 > ma10 > ma20:
+            score += 1
+            details["均線"] = {"status": "短期多頭排列", "score": 1, "pass": True,
+                               "detail": f"MA5{ma5:.1f}>MA10{ma10:.1f}>MA20{ma20:.1f}"}
+        else:
+            details["均線"] = {"status": "尚未排列", "score": 0, "pass": False, "detail": ""}
+
+        # KD
+        K_v = ind["K"].values; D_v = ind["D"].values
+        k0, d0_ = float(K_v[-1]), float(D_v[-1])
+        k1, d1_ = float(K_v[-2]), float(D_v[-2])
+        if k0 > d0_ and k1 <= d1_ and k0 < 30:
+            score += 2
+            details["KD"] = {"status": "超賣黃金交叉", "score": 2, "pass": True,
+                              "detail": f"K={k0:.1f} D={d0_:.1f}"}
+        elif k0 > d0_ and k1 <= d1_:
+            score += 1
+            details["KD"] = {"status": "黃金交叉", "score": 1, "pass": True,
+                              "detail": f"K={k0:.1f} D={d0_:.1f}"}
+        elif k0 > d0_ and k0 > 50:
+            score += 1
+            details["KD"] = {"status": "多方強勢", "score": 1, "pass": True,
+                              "detail": f"K={k0:.1f}"}
+        else:
+            details["KD"] = {"status": "偏弱", "score": 0, "pass": False,
+                              "detail": f"K={k0:.1f} D={d0_:.1f}"}
+
+        # RSI
+        rsi_v = ind["rsi"].values
+        r0, r1 = float(rsi_v[-1]), float(rsi_v[-2])
+        if r0 == r0:
+            if r0 > 50 and r1 <= 50 and 50 < r0 < 70:
+                score += 2
+                details["RSI"] = {"status": "突破50強勢", "score": 2, "pass": True,
+                                   "detail": f"RSI={r0:.1f}"}
+            elif 30 <= r0 < 70:
+                score += 1
+                details["RSI"] = {"status": "位置適當", "score": 1, "pass": True,
+                                   "detail": f"RSI={r0:.1f}"}
+            elif r0 >= 70:
+                details["RSI"] = {"status": "過熱警示", "score": 0, "pass": False,
+                                   "detail": f"RSI={r0:.1f}"}
+            else:
+                details["RSI"] = {"status": "偏弱", "score": 0, "pass": False,
+                                   "detail": f"RSI={r0:.1f}"}
+
+        # OBV
+        obv_v   = ind["obv"].values
+        obv_ma_v= ind["obv_ma"].values
+        obv0    = float(obv_v[-1])
+        obv_ma0 = float(obv_ma_v[-1])
+        obv_max = float(obv_v[-20:].max())
+        if obv0 >= obv_max * 0.98 and obv0 > obv_ma0:
+            score += 2
+            details["OBV"] = {"status": "創高放量", "score": 2, "pass": True,
+                               "detail": "OBV突破近期高點"}
+        elif obv0 > obv_ma0:
+            score += 1
+            details["OBV"] = {"status": "量能健康", "score": 1, "pass": True,
+                               "detail": "OBV站上均線"}
+        else:
+            details["OBV"] = {"status": "量能偏弱", "score": 0, "pass": False, "detail": ""}
+
+        # 布林
+        bu_v = ind["bb_upper"].values
+        bm_v = ind["bb_mid"].values
+        bl_v = ind["bb_lower"].values
+        bu0, bm0, bl0 = float(bu_v[-1]), float(bm_v[-1]), float(bl_v[-1])
+        if bm0 == bm0:
+            bw_now  = (bu0 - bl0) / bm0 if bm0 > 0 else 0
+            bm5     = float(bm_v[-5]) if len(c_v) >= 5 else bm0
+            bu5     = float(bu_v[-5]) if len(c_v) >= 5 else bu0
+            bl5     = float(bl_v[-5]) if len(c_v) >= 5 else bl0
+            bw_prev = (bu5 - bl5) / bm5 if bm5 > 0 else 0
+            expanding = bw_now > bw_prev and c0 > bm0
+            if expanding:
+                score += 2
+                details["布林"] = {"status": "開口擴張多方", "score": 2, "pass": True,
+                                    "detail": f"站上中軌{bm0:.1f}，通道擴張"}
+            elif c0 > bm0:
+                score += 1
+                details["布林"] = {"status": "站上中軌", "score": 1, "pass": True,
+                                    "detail": f"中軌={bm0:.1f}"}
+            elif c0 <= bl0 * 1.02:
+                score += 1
+                details["布林"] = {"status": "下軌支撐", "score": 1, "pass": True,
+                                    "detail": f"靠近下軌{bl0:.1f}"}
+            else:
+                details["布林"] = {"status": "中軌下方", "score": 0, "pass": False, "detail": ""}
+
+    except Exception:
+        pass
+
+    if score >= 9:   grade, gc = "🔥 強烈買進", "#FF1744"
+    elif score >= 7: grade, gc = "⭐ 積極買進", "#FF9800"
+    elif score >= 5: grade, gc = "👀 觀察追蹤", "#FFD700"
+    elif score >= 3: grade, gc = "⏳ 繼續等待", "#78909C"
+    else:            grade, gc = "❌ 條件不足", "#546E7A"
+
+    return {"score": score, "max_score": 10, "grade": grade, "grade_color": gc,
+            "details": details,
+            "kd_k": _last_scalar(ind.get("K",   pd.Series([0]))),
+            "kd_d": _last_scalar(ind.get("D",   pd.Series([0]))),
+            "rsi":  _last_scalar(ind.get("rsi", pd.Series([0])))}
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ Pivot 偵測（★ 改用 numba JIT）
+# ══════════════════════════════════════════════════════════
+def find_pivot_lows(series: pd.Series, left: int = 3, right: int = 3) -> list:
+    arr = series.values.astype(np.float64)
+    return find_pivot_lows_nb(arr, left, right).tolist()
+
+def find_pivot_highs(series: pd.Series, left: int = 3, right: int = 3) -> list:
+    arr = series.values.astype(np.float64)
+    return find_pivot_highs_nb(arr, left, right).tolist()
+
+
+def detect_divergence(price, indicator, pivot_left=3, pivot_right=3,
+                       lookback=120, min_gap=4) -> dict:
+    result = {"regular_bull": False, "hidden_bull": False,
+              "regular_bars": 999,   "hidden_bars": 999,
+              "price_low1": 0.0, "price_low2": 0.0,
+              "ind_low1": 0.0,   "ind_low2": 0.0, "detail": ""}
+    min_len = pivot_left + pivot_right + min_gap + 5
+    if len(price) < min_len:
+        return result
+    actual_lb = min(lookback, len(price))
+    p_sl = price.iloc[-actual_lb:].ffill().bfill().fillna(0)
+    i_sl = indicator.iloc[-actual_lb:].ffill().bfill().fillna(0)
+    pv = p_sl.values.astype(np.float64)
+    iv = i_sl.values.astype(np.float64)
+    pp = find_pivot_lows_nb(pv, pivot_left, pivot_right)
+    ip = find_pivot_lows_nb(iv, pivot_left, pivot_right)
+    if len(pp) < 2 or len(ip) < 2:
+        return result
+    n  = len(pv)
+    p1_idx = int(pp[-1])
+    p2_idx = None
+    for x in reversed(pp[:-1].tolist()):
+        if p1_idx - x >= min_gap:
+            p2_idx = int(x); break
+    if p2_idx is None:
+        return result
+    sr = max(pivot_left + pivot_right, 6)
+    ip_list = ip.tolist()
+    def nearest_ip(pidx):
+        best = None
+        for x in ip_list:
+            if abs(x - pidx) <= sr:
+                if best is None or abs(x - pidx) < abs(best - pidx):
+                    best = x
+        return best if best is not None else pidx
+    i1_idx = nearest_ip(p1_idx); i2_idx = nearest_ip(p2_idx)
+    p1, p2 = float(pv[p1_idx]), float(pv[p2_idx])
+    i1, i2 = float(iv[i1_idx]), float(iv[i2_idx])
+    if any(v != v for v in [p1, p2, i1, i2]):
+        return result
+    bars_since = n - 1 - p1_idx
+    if p1 < p2 and i1 > i2:
+        result["regular_bull"]  = True
+        result["regular_bars"]  = bars_since
+        result["detail"]        = f"正規底背離：價格{p2:.2f}→{p1:.2f}，指標底部抬高，距今{bars_since}根"
+    if p1 > p2 and i1 < i2:
+        result["hidden_bull"]   = True
+        result["hidden_bars"]   = bars_since
+        result["detail"]        = f"隱藏底背離：價格更高低點，指標更低，距今{bars_since}根"
+    result.update({"price_low1": round(p1,2), "price_low2": round(p2,2),
+                   "ind_low1": round(i1,4),   "ind_low2": round(i2,4)})
+    return result
+
+
+def calc_divergence_signals(ind: dict, closes: pd.Series, highs: pd.Series,
+                              lows: pd.Series, volumes: pd.Series,
+                              pivot_left=3, pivot_right=3,
+                              lookback=120, max_bars=15) -> dict:
+    buy_signals = []; score = 0
+
+    try:
+        md = detect_divergence(closes, ind["hist"], pivot_left, pivot_right, lookback)
+        if md["regular_bull"] and md["regular_bars"] <= max_bars:
+            score += 2
+            buy_signals.append({"id": "DIV_MACD_R", "name": "MACD 正規底背離",
+                "color": "#CE93D8", "desc": md["detail"]+"（反轉訊號）",
+                "type": "regular", "indicator": "MACD", "priority": 4})
+        if md["hidden_bull"] and md["hidden_bars"] <= max_bars:
+            score += 1
+            buy_signals.append({"id": "DIV_MACD_H", "name": "MACD 隱藏底背離",
+                "color": "#80DEEA", "desc": md["detail"]+"（趨勢延續）",
+                "type": "hidden", "indicator": "MACD", "priority": 3})
+    except Exception:
+        md = {}
+
+    try:
+        rd = detect_divergence(closes, ind["rsi"], pivot_left, pivot_right, lookback)
+        if rd["regular_bull"] and rd["regular_bars"] <= max_bars:
+            score += 2
+            buy_signals.append({"id": "DIV_RSI_R", "name": "RSI 正規底背離",
+                "color": "#A5D6A7", "desc": rd["detail"]+"（反轉訊號）",
+                "type": "regular", "indicator": "RSI", "priority": 4})
+        if rd["hidden_bull"] and rd["hidden_bars"] <= max_bars:
+            score += 1
+            buy_signals.append({"id": "DIV_RSI_H", "name": "RSI 隱藏底背離",
+                "color": "#80CBC4", "desc": rd["detail"]+"（趨勢延續）",
+                "type": "hidden", "indicator": "RSI", "priority": 3})
+    except Exception:
+        rd = {}
+
+    try:
+        kd = detect_divergence(closes, ind["K"], pivot_left, pivot_right, lookback)
+        if kd["regular_bull"] and kd["regular_bars"] <= max_bars:
+            score += 2
+            buy_signals.append({"id": "DIV_KD_R", "name": "KD 正規底背離",
+                "color": "#FFCC80", "desc": kd["detail"]+"（反轉訊號）",
+                "type": "regular", "indicator": "KD", "priority": 3})
+        if kd["hidden_bull"] and kd["hidden_bars"] <= max_bars:
+            score += 1
+            buy_signals.append({"id": "DIV_KD_H", "name": "KD 隱藏底背離",
+                "color": "#FFAB91", "desc": kd["detail"]+"（趨勢延續）",
+                "type": "hidden", "indicator": "KD", "priority": 2})
+    except Exception:
+        kd = {}
+
+    reg_c = sum(1 for s in buy_signals if s["type"] == "regular")
+    hid_c = sum(1 for s in buy_signals if s["type"] == "hidden")
+    if reg_c >= 2: score += 1
+    if hid_c >= 2: score += 1
+
+    parts = []
+    if reg_c: parts.append(f"正規底背離：{'+'.join(s['indicator'] for s in buy_signals if s['type']=='regular')}")
+    if hid_c: parts.append(f"隱藏底背離：{'+'.join(s['indicator'] for s in buy_signals if s['type']=='hidden')}")
+
+    buy_signals.sort(key=lambda x: -x["priority"])
+    return {"buy_signals": buy_signals, "macd_div": md, "rsi_div": rd, "kd_div": kd,
+            "score": min(score, 6), "summary": "；".join(parts) if parts else "無背離訊號",
+            "regular_count": reg_c, "hidden_count": hid_c}
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 費波南 / 威廉
+# ══════════════════════════════════════════════════════════
+def calc_fibonacci_signals(closes, opens, highs, lows, ind: dict) -> dict:
+    n = len(closes)
+    if n < 25:
+        return {"basic_pass": False, "signals_count": 0, "buy_signals": [],
+                "details": {}, "fib_levels": {}, "pressure_bars": []}
+    c = closes.values; o = opens.values; h = highs.values; l = lows.values
+    ma3  = float(c[-3:].mean())
+    ma5  = _last_scalar(ind["ma5"])
+    ma10 = _last_scalar(ind["ma10"])
+    c0 = float(c[-1]); c1 = float(c[-2]); h2 = float(h[-3])
+    basic_pass = (c1 < h2) and (c1 < ma5 or c1 < ma10)
+
+    lookback_days = [1, 2, 3, 4, 5, 8, 13]
+    pressure_bars = []
+    for d in lookback_days:
+        if n <= d + 1: continue
+        idx  = -(d + 1); ck = float(c[idx]); ok = float(o[idx])
+        pressure = ok if ck >= ok else (ck + ok) / 2
+        pressure_bars.append({"days_ago": d, "is_red": ck >= ok,
+                               "pressure": round(pressure, 2), "broken": c0 > pressure})
+    broken_count   = sum(1 for pb in pressure_bars if pb["broken"])
+    above_ma3_or_5 = c0 > ma3 or c0 > ma5
+
+    week_signals = 0
+    def gp(days_ago):
+        idx = -(days_ago + 1)
+        if abs(idx) > n: return None
+        ck = float(c[idx]); ok = float(o[idx])
+        return ok if ck >= ok else (ck + ok) / 2
+    for da, lbl in [(5,"週1"),(1,"週1K"),(4,"週4")]:
+        p = gp(da)
+        if p and c0 > p: week_signals += 1
+
+    def sm_body(idx):
+        if abs(idx) > n-1: return False
+        body = abs(float(c[idx])-float(o[idx])); rng = float(h[idx])-float(l[idx])
+        return rng > 0 and body/rng < 0.3
+    double_star = sm_body(-2) and sm_body(-3)
+    def is_harami():
+        if n < 3: return False
+        ph = max(float(o[-3]),float(c[-3])); pl = min(float(o[-3]),float(c[-3]))
+        ch = max(float(o[-2]),float(c[-2])); cl = min(float(o[-2]),float(c[-2]))
+        return ph > ch and pl < cl
+    harami = is_harami()
+    pattern_found = double_star or harami
+
+    lb_high = min(50, n-1)
+    rb_idx  = n - lb_high + int(highs.iloc[-lb_high:].values.argmax())
+    bars_fh = n - 1 - rb_idx
+    fib_bar_levels = [5, 8, 13, 21]
+    fib_bar_hit    = [fb for fb in fib_bar_levels if abs(bars_fh - fb) <= 1]
+    sw_high = float(highs.iloc[-lb_high:].max())
+    sw_low  = float(lows.iloc[-lb_high:].min())
+    pr      = sw_high - sw_low
+    fib_supports = {"0.618": round(sw_high - pr*0.618,2),
+                    "0.500": round(sw_high - pr*0.5,2),
+                    "0.382": round(sw_high - pr*0.382,2)}
+    near_fib = any(abs(c0-v)/v < 0.02 for v in fib_supports.values())
+
+    buy_signals = []
+    if above_ma3_or_5 and broken_count >= 4:
+        buy_signals.append({"id":"FA","name":"費波南A：4訊號突破",
+            "desc":f"突破{broken_count}個變盤壓力","color":"#FF6B35"})
+    if week_signals >= 2 and broken_count >= 3:
+        buy_signals.append({"id":"FB","name":"費波南B：週期突破",
+            "desc":f"週期訊號{week_signals}個","color":"#FF9F1C"})
+    if pattern_found and above_ma3_or_5 and broken_count >= 3:
+        pname = "雙星" if double_star else "孕育K"
+        buy_signals.append({"id":"FC","name":f"費波南C：{pname}+突破",
+            "desc":f"{pname}型態+{broken_count}個訊號","color":"#FFBF69"})
+    if fib_bar_hit and above_ma3_or_5 and broken_count >= 3:
+        buy_signals.append({"id":"FD","name":"費波南D：數列壓力突破",
+            "desc":f"距高點{bars_fh}根，突破壓力","color":"#CBF3F0"})
+    if near_fib and above_ma3_or_5:
+        buy_signals.append({"id":"FE","name":"費波南E：黃金分割支撐",
+            "desc":"近黃金分割支撐","color":"#2EC4B6"})
+
+    return {"basic_pass": basic_pass, "signals_count": broken_count,
+            "buy_signals": buy_signals,
+            "details": {"broken_count": broken_count, "above_ma3_or_5": above_ma3_or_5,
+                        "week_signals": week_signals, "pattern_found": pattern_found,
+                        "bars_from_high": bars_fh, "fib_bar_hit": fib_bar_hit,
+                        "near_fib_support": near_fib,
+                        "ma3": round(ma3, 2), "ma5": round(ma5, 2), "ma10": round(ma10, 2),
+                        "close": round(c0, 2)},
+            "fib_levels": fib_supports, "pressure_bars": pressure_bars}
+
+
+def calc_williams_signals(ind: dict, closes: pd.Series,
+                           highs: pd.Series = None, lows: pd.Series = None) -> dict:
+    h = highs if highs is not None else closes
+    l = lows  if lows  is not None else closes
+    return calc_williams_signals_v4(closes, h, l, ind=ind)
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 永豐 Shioaji
+# ══════════════════════════════════════════════════════════
+try:
+    from config import SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY
+except ImportError:
+    SHIOAJI_API_KEY = ""; SHIOAJI_SECRET_KEY = ""
+
+try:
+    import shioaji as sj
+    HAS_SJ = True
+except ImportError:
+    HAS_SJ = False
+
+_sj_api = None; _sj_lock = threading.Lock(); _sj_ready = False
+
+def init_shioaji():
+    global _sj_api, _sj_ready
+    if not HAS_SJ or not SHIOAJI_API_KEY:
+        print("⚠ 未設定永豐 API 金鑰，使用 TWSE 延遲報價"); return False
+    try:
+        with _sj_lock:
+            if _sj_ready: return True
+            api = sj.Shioaji(simulation=False)
+            api.login(api_key=SHIOAJI_API_KEY, secret_key=SHIOAJI_SECRET_KEY, fetch_contract=True)
+            _sj_api = api; _sj_ready = True
+            print("✅ 永豐 Shioaji 連線成功"); return True
+    except Exception as e:
+        print(f"❌ 永豐連線失敗：{e}"); return False
+
+def fetch_shioaji_batch(stock_ids: list) -> dict:
+    now = datetime.now()
+    t   = now.hour * 60 + now.minute
+    is_trading = (9*60 <= t <= 13*60+35) and (now.weekday() < 5)
+    if not is_trading:
+        return {}
+    if not _sj_ready or _sj_api is None: return {}
+    result = {}
+    try:
+        contracts = []; id_map = {}
+        for sid in stock_ids:
+            for market in [_sj_api.Contracts.Stocks.TSE, _sj_api.Contracts.Stocks.OTC]:
+                try:
+                    c = market[sid]
+                    if c: contracts.append(c); id_map[c.code] = sid; break
+                except: continue
+        if not contracts: return {}
+        snaps = _sj_api.snapshots(contracts)
+        for snap in snaps:
+            try:
+                sid = id_map.get(snap.code, snap.code)
+                close = float(snap.close) if snap.close else 0
+                if close <= 0: continue
+                chg_p = float(getattr(snap,"change_price",0) or 0)
+                result[sid] = {"close": close,
+                    "open":   float(snap.open)  if snap.open  else close,
+                    "high":   float(snap.high)  if snap.high  else close,
+                    "low":    float(snap.low)   if snap.low   else close,
+                    "yest":   close - chg_p,
+                    "volume": float(getattr(snap,"total_volume",None) or snap.volume or 0),
+                    "name":   getattr(snap,"name",sid),
+                    "time":   str(getattr(snap,"ts",""))[:19], "source": "shioaji"}
+            except: continue
+    except Exception as e:
+        print(f"  批次報價錯誤: {e}")
+    return result
+
+TWSE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+HEADERS  = {"User-Agent":"Mozilla/5.0","Referer":"https://mis.twse.com.tw/"}
+
+def fetch_twse_price(stock_id, ex="tse"):
+    try:
+        key = f"{ex}_{stock_id}.tw"
+        r = requests.get(TWSE_URL, params={"ex_ch":key,"json":1,"delay":0},
+                         headers=HEADERS, timeout=5)
+        item = r.json().get("msgArray",[{}])[0]
+        if not item.get("z") or item["z"]=="-": return None
+        return {"close":float(item.get("z",0)),"open":float(item.get("o",0)),
+                "high":float(item.get("h",0)),"low":float(item.get("l",0)),
+                "yest":float(item.get("y",0)),"volume":float(item.get("v",0)),
+                "name":item.get("n",stock_id),"time":item.get("t",""),"source":"twse"}
+    except: return None
+
+def fetch_yahoo_today(stock_id, ex="tse"):
+    try:
+        suffix = ".TW" if ex=="tse" else ".TWO"
+        info = yf.Ticker(f"{stock_id}{suffix}").fast_info
+        close = float(info.last_price) if info.last_price else 0
+        if close == 0: return None
+        prev = float(info.previous_close) if info.previous_close else close
+        return {"close":close,"open":float(info.open or close),
+                "high":float(info.day_high or close),"low":float(info.day_low or close),
+                "yest":prev,"volume":float(info.three_month_average_volume or 0),
+                "name":stock_id,"time":datetime.now().strftime("%H:%M:%S"),"source":"yahoo"}
+    except: return None
+
+_rt_batch_cache = {}; _rt_batch_time = 0; _rt_batch_lock = threading.Lock(); _RT_BATCH_TTL = 60
+
+def fetch_realtime_price(stock_id, ex="tse"):
+    with _rt_batch_lock:
+        if time.time() - _rt_batch_time < _RT_BATCH_TTL:
+            rt = _rt_batch_cache.get(stock_id)
+            if rt and rt.get("close",0) > 0: return rt
+    if _sj_ready:
+        rt = fetch_shioaji_batch([stock_id]).get(stock_id)
+        if rt and rt.get("close",0) > 0: return rt
+    rt = fetch_twse_price(stock_id, ex)
+    if rt and rt.get("close",0) > 0: return rt
+    return fetch_yahoo_today(stock_id, ex)
+
+threading.Thread(target=init_shioaji, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ analyze_stock（★ 移除 pd.concat 單列附加）
+# ══════════════════════════════════════════════════════════
+def _append_one(series: pd.Series, value, new_idx) -> pd.Series:
+    """以 numpy append 取代 pd.concat 單列附加，加速 ~5-10x"""
+    arr = np.append(series.values, value)
+    return pd.Series(arr, index=series.index.append(pd.DatetimeIndex([new_idx])))
+
+
+def analyze_stock(stock: dict) -> dict:
+    sid = stock["id"]; ex = stock.get("ex","tse")
+    hist = fetch_history(sid, ex=ex)
+    has_history = len(hist) >= 30
+    rt = fetch_realtime_price(sid, ex)
+
+    def clean(v, d=0):
+        try:
+            f = float(v)
+            return d if (f != f or np.isinf(f)) else f
+        except: return d
+
+    if has_history:
+        # 取出原始 Series（不額外 copy，後面只在需要時才寫入）
+        closes  = hist["Close"]
+        volumes = hist["Volume"]
+        highs   = hist["High"]  if "High"  in hist.columns else closes
+        lows_s  = hist["Low"]   if "Low"   in hist.columns else closes
+        opens_s = hist["Open"]  if "Open"  in hist.columns else closes
+
+        # 更新今日即時報價
+        if rt and rt.get("close", 0) > 0:
+            today = pd.Timestamp(date.today())
+            if today in closes.index:
+                # 已存在今日 → 直接覆寫（避免 SettingWithCopyWarning：先 copy 再寫）
+                closes  = closes.copy();  closes.iloc[-1]  = rt["close"]
+                volumes = volumes.copy(); volumes.iloc[-1] = rt.get("volume", volumes.iloc[-1])
+                highs   = highs.copy();   highs.iloc[-1]   = rt.get("high",   highs.iloc[-1])
+                lows_s  = lows_s.copy();  lows_s.iloc[-1]  = rt.get("low",    lows_s.iloc[-1])
+            else:
+                # 用 numpy append（比 pd.concat 快 5x+）
+                closes  = _append_one(closes,  rt["close"], today)
+                volumes = _append_one(volumes, rt.get("volume", volumes.values[-1]), today)
+                highs   = _append_one(highs,   rt.get("high",  rt["close"]),         today)
+                lows_s  = _append_one(lows_s,  rt.get("low",   rt["close"]),         today)
+                opens_s = _append_one(opens_s, rt.get("open",  rt["close"]),         today)
+
+        ind = calc_all_indicators(closes, highs, lows_s, volumes)
+
+        signals  = eval_strategies(ind, closes, volumes)
+        confirm  = calc_confirm_score(ind, closes, volumes)
+        fib_res  = calc_fibonacci_signals(closes, opens_s, highs, lows_s, ind)
+        wr_res   = calc_williams_signals_v4(closes, highs, lows_s, ind=ind)
+        div_res  = {"buy_signals":[],"score":0,"summary":"","macd_div":{},"rsi_div":{},
+                    "kd_div":{},"regular_count":0,"hidden_count":0}
+
+        ut_buy_v   = ind["ut_buy"].values
+        ut_sell_v  = ind["ut_sell"].values
+        ut_trend_v = ind["ut_trend"].values
+        ut_trail_v = ind["ut_trail"].values
+        ut_buy_now   = bool(ut_buy_v[-1])
+        ut_sell_now  = bool(ut_sell_v[-1])
+        ut_trend_now = int(ut_trend_v[-1])
+        ut_trail_now = round(float(ut_trail_v[-1]), 2)
+
+        vr_v = ind["vol_ratio"].values
+        vol_ratio = clean(vr_v[-1], 1.0)
+        close_now = clean(closes.values[-1])
+        yest      = rt.get("yest", clean(closes.values[-2])) if rt else clean(closes.values[-2])
+        sparkline = [clean(v) for v in closes.values[-30:].tolist()]
+
+    else:
+        ind = {}
+        signals = []; confirm = {"score":0,"max_score":10,"grade":"資料不足",
+            "grade_color":"#546E7A","details":{},"kd_k":0,"kd_d":0,"rsi":0}
+        vol_ratio = 1.0; close_now = rt["close"] if rt else 0; yest = rt.get("yest",0) if rt else 0
+        sparkline = []; ut_buy_now = ut_sell_now = False; ut_trend_now = 0; ut_trail_now = 0.0
+        fib_res = {"basic_pass":False,"signals_count":0,"buy_signals":[],"details":{},"fib_levels":{},"pressure_bars":[]}
+        wr_res  = {"buy_signals":[],"wave_info":{},"wr_now":0,"wr_list":[]}
+        div_res = {"buy_signals":[],"score":0,"summary":"資料不足","macd_div":{},"rsi_div":{},"kd_div":{},"regular_count":0,"hidden_count":0}
+
+    change = close_now - yest
+    change_pct = (change / yest * 100) if yest > 0 else 0
+
+    return {
+        "id":           sid,
+        "name":         next((s.get("name","") for s in watchlist if s["id"]==sid), "") or
+                        (rt["name"] if rt else stock.get("name", sid)),
+        "close":        clean(close_now),
+        "yest":         clean(yest),
+        "change":       clean(change),
+        "change_pct":   clean(change_pct),
+        "volume":       int(volumes.values[-1]) if has_history else (int(rt.get("volume",0)) if rt else 0),
+        "vol_ratio":    clean(vol_ratio, 1.0),
+        "ma5":  _last_scalar(ind.get("ma5",  pd.Series([0]))) if ind else 0,
+        "ma10": _last_scalar(ind.get("ma10", pd.Series([0]))) if ind else 0,
+        "ma20": _last_scalar(ind.get("ma20", pd.Series([0]))) if ind else 0,
+        "dif":  _last_scalar(ind.get("dif",  pd.Series([0]))) if ind else 0,
+        "dea":  _last_scalar(ind.get("dea",  pd.Series([0]))) if ind else 0,
+        "hist": _last_scalar(ind.get("hist", pd.Series([0]))) if ind else 0,
+        "signals":      signals, "confirm": confirm,
+        "ut_buy":  ut_buy_now,  "ut_sell": ut_sell_now,
+        "ut_trend":ut_trend_now,"ut_trail":ut_trail_now,
+        "ut_macd_combo": ut_buy_now, "ut_combo_strong": ut_buy_now,
+        "fib":  fib_res, "wr": wr_res, "div": div_res,
+        "sparkline":   sparkline,
+        "hist_bars":   [],
+        "rt_time":     rt["time"]   if rt else "",
+        "rt_source":   rt.get("source","twse") if rt else "none",
+        "has_data":    has_history,
+        "scanned_at":  datetime.now().strftime("%H:%M:%S"),
+    }
+
+def analyze_stock_safe(stock: dict):
+    try:
+        return analyze_stock(stock)
+    except Exception as e:
+        print(f"  ⚠ {stock['id']} 分析失敗: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 快速模式 analyze
+# ══════════════════════════════════════════════════════════
+def analyze_stock_fast(stock: dict):
+    sid = stock["id"]; ex = stock.get("ex","tse")
+    with _rt_batch_lock:
+        rt = _rt_batch_cache.get(sid)
+    with cache_lock:
+        cached = cache.get(sid)
+
+    if cached and cached.get("has_data") and rt and rt.get("close",0) > 0:
+        close_now = rt["close"]
+        yest = rt.get("yest", cached.get("yest", close_now))
+        change = close_now - yest
+        change_pct = (change / yest * 100) if yest > 0 else 0
+        updated = dict(cached)
+        updated.update({"close": round(close_now,2), "change": round(change,2),
+            "change_pct": round(change_pct,2), "rt_time": rt.get("time",""),
+            "rt_source": rt.get("source",""), "scanned_at": datetime.now().strftime("%H:%M:%S"),
+            "volume": int(rt.get("volume", cached.get("volume",0))),
+            "name": next((s.get("name","") for s in watchlist if s["id"]==sid), cached.get("name",""))})
+        return updated
+
+    now = datetime.now()
+    t_min = now.hour * 60 + now.minute
+    is_trading = (9*60 <= t_min <= 13*60+35) and (now.weekday() < 5)
+    if cached and cached.get("has_data") and not is_trading:
+        updated = dict(cached)
+        updated["scanned_at"] = datetime.now().strftime("%H:%M:%S")
+        updated["rt_source"]  = "cache_offhour"
+        return updated
+
+    return analyze_stock_safe(stock)
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 主掃描（★ 先批量補齊歷史快取，再丟給 worker）
+# ══════════════════════════════════════════════════════════
+def batch_scan_all(batch_size: int = 100, delay: float = 0.0,
+                   fast_mode: bool = True) -> list:
+    stocks = list(watchlist); total = len(stocks)
+    results = []; signals_found = 0
+
+    if fast_mode and len(hist_cache) < 50:
+        fast_mode = False
+
+    scan_fn = analyze_stock_fast if fast_mode else analyze_stock_safe
+    mode_str = "快速" if fast_mode else "完整"
+    print(f"  📊 {mode_str}掃描：{total} 支，{SCAN_WORKERS} 線程")
+
+    # ★ 完整模式：先把所有缺失歷史一次批次補齊
+    if not fast_mode:
+        missing = []
+        for s in stocks:
+            key = _hist_key(s["id"], "3mo", s.get("ex", "tse"))
+            if _get_hist_cache(key) is None:
+                with _delisted_lock:
+                    if s["id"] in _delisted_set:
+                        continue
+                missing.append(s)
+        if missing:
+            print(f"  ⬇  批次補齊歷史：{len(missing)} 支...")
+            t0 = time.time()
+            fetch_history_batch(missing, period="3mo")
+            print(f"  ✅ 歷史補齊 {round(time.time()-t0,1)} 秒")
+
+    # 一次取得所有即時報價
+    if _sj_ready:
+        all_ids = [s["id"] for s in stocks]
+        print("  🔄 批次取得即時報價...")
+        t0 = time.time()
+        batch_prices = fetch_shioaji_batch(all_ids)
+        with _rt_batch_lock:
+            global _rt_batch_cache, _rt_batch_time
+            _rt_batch_cache = batch_prices; _rt_batch_time = time.time()
+        print(f"  ✅ 報價取得 {len(batch_prices)}/{total} 支 ({round(time.time()-t0,1)}秒)")
+
+    t0 = time.time()
+    futures = {_global_executor.submit(scan_fn, s): s for s in stocks}
+
+    done_count = 0
+    for future in as_completed(futures):
+        try:
+            r = future.result(timeout=30)
+            if r and r.get("close",0) > 0 and r.get("volume",0) >= 10:
+                results.append(r)
+                with cache_lock: cache[r["id"]] = r
+                if (r.get("fib",{}).get("buy_signals") or
+                        r.get("wr",{}).get("buy_signals") or r.get("ut_buy")):
+                    signals_found += 1
+        except Exception:
+            pass
+        done_count += 1
+        if done_count % 100 == 0:
+            pct = done_count * 100 // total
+            print(f"  進度 {done_count}/{total} ({pct}%) 訊號{signals_found}檔", end="\r")
+
+    elapsed = round(time.time() - t0, 1)
+    print(f"\n  ✅ {mode_str}掃描完成：{len(results)}/{total} 支，{signals_found} 個訊號，{elapsed} 秒")
+    return results
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 股票清單管理
+# ══════════════════════════════════════════════════════════
+def fetch_twse_stock_list():
+    try:
+        r = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+                         timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        return [{"id":str(x["Code"]),"name":str(x["Name"]),"ex":"tse"}
+                for x in r.json() if str(x.get("Code","")).isdigit() and len(str(x["Code"]))==4]
+    except Exception as e:
+        print(f"  ⚠ TWSE清單失敗: {e}"); return []
+
+def fetch_otc_stock_list():
+    try:
+        r = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+                         timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        return [{"id":str(x["SecuritiesCompanyCode"]),"name":str(x["CompanyName"]),"ex":"otc"}
+                for x in r.json() if str(x.get("SecuritiesCompanyCode","")).isdigit()
+                and len(str(x["SecuritiesCompanyCode"]))==4]
+    except Exception as e:
+        print(f"  ⚠ TPEx清單失敗: {e}"); return []
+
+def load_full_stock_list():
+    global full_stock_list, full_list_loaded, watchlist
+    if os.path.exists(FULL_LIST_FILE):
+        try:
+            if (time.time() - os.path.getmtime(FULL_LIST_FILE)) < 86400:
+                with open(FULL_LIST_FILE,"r",encoding="utf-8") as f:
+                    data = json.load(f)
+                if len(data) > 100:
+                    with full_list_lock:
+                        full_stock_list = data; full_list_loaded = True; watchlist = data
+                    print(f"  ✅ 從快取載入完整清單：{len(data)} 檔"); return
+        except: pass
+    tse = fetch_twse_stock_list(); otc = fetch_otc_stock_list()
+    seen = set(); unique = []
+    for s in tse + otc:
+        if s["id"] not in seen: seen.add(s["id"]); unique.append(s)
+    if len(unique) > 100:
+        with open(FULL_LIST_FILE,"w",encoding="utf-8") as f:
+            json.dump(unique, f, ensure_ascii=False)
+        with full_list_lock:
+            full_stock_list = unique; full_list_loaded = True; watchlist = unique
+        print(f"  ✅ 完整清單載入：{len(unique)} 檔")
+
+# ══════════════════════════════════════════════════════════
+# ▌ 觀察清單 2
+# ══════════════════════════════════════════════════════════
+watchlist2 = []
+watchlist2_lock = threading.Lock()
+
+def load_watchlist2():
+    global watchlist2
+    try:
+        if os.path.exists(WATCHLIST2_FILE):
+            with open(WATCHLIST2_FILE,"r",encoding="utf-8") as f:
+                watchlist2 = json.load(f)
+    except: pass
+
+def save_watchlist2(data):
+    try:
+        with open(WATCHLIST2_FILE,"w",encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"儲存失敗: {e}")
+
+def add_to_watchlist2(r: dict, min_score: int = 3):
+    global watchlist2
+    score = (r.get("confirm") or {}).get("score", 0)
+    if score < min_score or not r.get("signals"): return False
+    sid = r.get("id"); name = r.get("name", sid)
+    ex  = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
+    with watchlist2_lock:
+        existing = next((s for s in watchlist2 if s["id"]==sid), None)
+        if existing:
+            existing.update({"score":score,"signals":[s["id"] for s in r.get("signals",[])],
+                "last_update":datetime.now().strftime("%Y-%m-%d %H:%M"),"close":r.get("close",0)})
+            save_watchlist2(watchlist2); return False
+        else:
+            watchlist2.append({"id":sid,"name":name,"ex":ex,"score":score,
+                "signals":[s["id"] for s in r.get("signals",[])],
+                "close":r.get("close",0),"added_date":datetime.now().strftime("%Y-%m-%d"),
+                "added_time":datetime.now().strftime("%H:%M"),
+                "last_update":datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ut_buy":False,"ut_trail":r.get("ut_trail",0),"note":""})
+            save_watchlist2(watchlist2); return True
+
+load_watchlist2()
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ Telegram
+# ══════════════════════════════════════════════════════════
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_API     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN: return False
+    try:
+        r = requests.post(TELEGRAM_API, json={"chat_id":TELEGRAM_CHAT_ID,
+            "text":msg,"parse_mode":"HTML"}, timeout=10)
+        return r.status_code == 200
+    except: return False
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 定時排程
+# ══════════════════════════════════════════════════════════
+scheduler_running = False; scheduler_interval = 30; last_notified = {}
+
+def is_market_hour():
+    now = datetime.now()
+    if now.weekday() >= 5: return False
+    t = now.hour*60 + now.minute
+    return 9*60 <= t <= 13*60+30
+
+def auto_scan_job():
+    t0 = time.time()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏱ 自動掃描（{len(watchlist)}支）...")
+    results = batch_scan_all()
+    if not results: return
+    elapsed = round(time.time()-t0,1)
+    for r in results:
+        try: add_to_watchlist2(r, min_score=3)
+        except: pass
+    notify_groups = {}
+    for r in results:
+        sid   = r.get("id")
+        has_fib = bool(r.get("fib",{}).get("buy_signals"))
+        has_ut  = bool(r.get("ut_buy"))
+        has_wr  = bool(r.get("wr",{}).get("buy_signals"))
+        div     = r.get("div",{})
+        has_div = bool(div.get("buy_signals"))
+        is_b = has_ut and has_fib and has_div
+        is_a = has_ut and has_wr and has_div
+        is_c = (has_fib or has_ut) and has_wr
+        if not (is_b or is_a or is_c): continue
+        lt = last_notified.get(sid)
+        if lt and (datetime.now()-lt).seconds < 1800: continue
+        last_notified[sid] = datetime.now()
+        g = "B" if is_b else ("A" if is_a else "C")
+        notify_groups.setdefault(g,[]).append(r)
+    if notify_groups:
+        lines = [f"📊 <b>買進訊號通知</b>",f"🕐 {datetime.now().strftime('%H:%M:%S')}  共{len(results)}支({elapsed}秒)",""]
+        for grp,label,emoji in [("B","費波南+UT Bot雙重確認","🔴"),("A","UT+威廉+指標背離","🟠"),("C","UT+費波南+威廉三重確認","🟣")]:
+            if grp not in notify_groups: continue
+            lines.append(f"{emoji} <b>{label}</b>")
+            for r in notify_groups[grp][:5]:
+                s = (r.get("confirm") or {}).get("score",0)
+                c = r.get("change_pct",0)
+                lines.append(f"  ★ <b>{r['name']}({r['id']})</b> ${r.get('close',0):.1f} "
+                             f"{'▲' if c>0 else '▼'}{abs(c):.2f}% 評分{s}分")
+            lines.append("")
+        lines.append("⚠ 僅供參考")
+        send_telegram("\n".join(lines))
+
+def scheduler_loop():
+    global scheduler_running
+    while scheduler_running:
+        if is_market_hour(): auto_scan_job()
+        else: print(f"[{datetime.now().strftime('%H:%M:%S')}] 非盤中，跳過")
+        for _ in range(scheduler_interval * 60):
+            if not scheduler_running: break
+            time.sleep(1)
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ Flask API 路由
+# ══════════════════════════════════════════════════════════
+@app.route("/api/scan", methods=["GET"])
+def api_scan():
+    for _ in range(12):
+        if preload_done: break
+        time.sleep(5); print(f"  ⏳ 等待預載... ({len(hist_cache)}/{len(watchlist)})")
+    try:
+        results = batch_scan_all()
+        for r in results:
+            try: add_to_watchlist2(r, min_score=3)
+            except: pass
+        display = [r for r in results if
+                   r.get("ut_buy") or r.get("fib",{}).get("buy_signals") or
+                   r.get("wr",{}).get("buy_signals") or (r.get("confirm") or {}).get("score",0)>=3]
+        return jsonify(sanitize({"data":display,"scanned_at":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total":len(results),"signals":len([r for r in results if r.get("signals")]),
+            "ut_combo":sum(1 for r in results if r.get("ut_buy")),
+            "full_loaded":full_list_loaded,"preload_done":preload_done,
+            "watchlist_size":len(watchlist)}))
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error":str(e),"data":[],"total":0}), 500
+
+@app.route("/api/stock/<sid>", methods=["GET"])
+def api_single(sid):
+    stock = next((s for s in watchlist if s["id"]==sid), {"id":sid,"name":sid,"ex":"tse"})
+    try:
+        return jsonify(sanitize(analyze_stock(stock)))
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/watchlist", methods=["GET"])
+def api_watchlist():
+    return jsonify(watchlist)
+
+@app.route("/api/watchlist/add", methods=["POST"])
+def api_add():
+    data = request.json; sid = data.get("id","").strip()
+    if not sid: return jsonify({"error":"缺少代號"}), 400
+    if any(s["id"]==sid for s in watchlist): return jsonify({"error":"已在清單"}), 400
+    watchlist.append({"id":sid,"name":data.get("name",sid),"ex":data.get("ex","tse")})
+    return jsonify({"ok":True})
+
+@app.route("/api/watchlist/remove/<sid>", methods=["DELETE"])
+def api_remove(sid):
+    global watchlist
+    watchlist = [s for s in watchlist if s["id"]!=sid]
+    with cache_lock: cache.pop(sid, None)
+    return jsonify({"ok":True})
+
+@app.route("/api/watchlist2", methods=["GET"])
+def api_watchlist2_get():
+    with watchlist2_lock: items = list(watchlist2)
+    for item in items:
+        cached = cache.get(item["id"],{})
+        if cached:
+            item.update({"ut_buy":cached.get("ut_buy",False),"ut_trail":cached.get("ut_trail",0),
+                "close":cached.get("close",item.get("close",0)),
+                "change_pct":cached.get("change_pct",0),
+                "score":(cached.get("confirm") or {}).get("score",item.get("score",0))})
+    items.sort(key=lambda x:(-int(x.get("ut_buy",False)),-x.get("score",0)))
+    return jsonify({"data":items,"total":len(items),
+        "ut_ready":sum(1 for x in items if x.get("ut_buy"))})
+
+@app.route("/api/watchlist2/remove/<sid>", methods=["DELETE"])
+def api_watchlist2_remove(sid):
+    global watchlist2
+    with watchlist2_lock:
+        watchlist2 = [s for s in watchlist2 if s["id"]!=sid]
+        save_watchlist2(watchlist2)
+    return jsonify({"ok":True})
+
+@app.route("/api/watchlist2/note", methods=["POST"])
+def api_watchlist2_note():
+    data = request.json; sid = data.get("id"); note = data.get("note","")
+    with watchlist2_lock:
+        item = next((s for s in watchlist2 if s["id"]==sid), None)
+        if item: item["note"] = note; save_watchlist2(watchlist2)
+    return jsonify({"ok":True})
+
+@app.route("/api/watchlist2/clear", methods=["POST"])
+def api_watchlist2_clear():
+    global watchlist2
+    with watchlist2_lock: watchlist2 = []; save_watchlist2(watchlist2)
+    return jsonify({"ok":True})
+
+@app.route("/api/scan/fibonacci", methods=["GET"])
+def api_scan_fibonacci():
+    with cache_lock: cached = list(cache.values())
+    hits = sorted([r for r in cached if r.get("fib",{}).get("buy_signals")],
+                  key=lambda x:(-len(x.get("fib",{}).get("buy_signals",[])),
+                                -x.get("fib",{}).get("signals_count",0)))
+    return jsonify(sanitize({"data":hits,"total":len(cached),"fib_count":len(hits),
+                    "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+@app.route("/api/scan/williams", methods=["GET"])
+def api_scan_williams():
+    with cache_lock: cached = list(cache.values())
+    hits = sorted([r for r in cached if r.get("wr",{}).get("buy_signals")],
+                  key=lambda x:-len(x.get("wr",{}).get("buy_signals",[])))
+    return jsonify(sanitize({"data":hits,"total":len(cached),"wr_count":len(hits),
+                    "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+@app.route("/api/scan/utbot", methods=["GET"])
+def api_scan_utbot():
+    with cache_lock: cached = list(cache.values())
+    combo = sorted([r for r in cached if r.get("ut_buy")],
+                   key=lambda x:-(x.get("confirm",{}).get("score",0)))
+    return jsonify(sanitize({"data":combo,"total":len(cached),"combo_count":len(combo),
+                    "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+@app.route("/api/scan/buysignal", methods=["GET"])
+def api_scan_buysignal():
+    mode = request.args.get("mode","A")
+    with cache_lock: cached = list(cache.values())
+    results = []
+    for r in cached:
+        if r.get("volume",0) < 20: continue
+
+        has_fib = bool(r.get("fib",{}).get("buy_signals"))
+        has_ut  = bool(r.get("ut_buy"))
+        has_wr  = bool(r.get("wr",{}).get("buy_signals"))
+        div     = r.get("div",{})
+        has_div = bool(div.get("buy_signals")) or div.get("score", 0) >= 2
+
+        close      = r.get("close",  0)
+        ma5        = r.get("ma5",    0)
+        ma10       = r.get("ma10",   0)
+        ma20       = r.get("ma20",   0)
+        ut_trail   = r.get("ut_trail", 0)
+        change_pct = r.get("change_pct", 0)
+
+        fib_detail  = r.get("fib", {}).get("details", {})
+        fib_ma3     = fib_detail.get("ma3", ma5)
+        fib_ma5     = fib_detail.get("ma5", ma5)
+        fib_above_ma = close > 0 and (
+            (fib_ma3 > 0 and close >= fib_ma3 * 0.995) or
+            (fib_ma5 > 0 and close >= fib_ma5 * 0.995) or
+            (ma5     > 0 and close >= ma5     * 0.995)
+        )
+
+        ut_above_trail = close > 0 and (
+            ut_trail <= 0 or close >= ut_trail * 0.995
+        )
+
+        not_falling = change_pct >= -1.0
+
+        above_short_ma = close > 0 and (
+            (ma5  > 0 and close >= ma5  * 0.995) or
+            (ma10 > 0 and close >= ma10 * 0.995)
+        )
+
+        if mode == "A":
+            triggered = (has_ut and ut_above_trail and
+                         has_wr and has_div and
+                         not_falling and above_short_ma)
+        elif mode == "B":
+            triggered = (has_ut and ut_above_trail and
+                         has_fib and fib_above_ma and
+                         not_falling and above_short_ma)
+        elif mode == "C":
+            confirm_score = (r.get("confirm") or {}).get("score", 0)
+            triggered = (has_ut and ut_above_trail and
+                         has_fib and fib_above_ma and
+                         has_wr and
+                         not_falling and above_short_ma and
+                         confirm_score > 3)
+        else:
+            triggered = (has_ut and ut_above_trail and
+                         has_fib and fib_above_ma and
+                         has_wr and not_falling)
+
+        if triggered:
+            r["buy_mode"]    = mode
+            r["buy_reasons"] = []
+            if has_fib:
+                fib_ids = " ".join(s["id"] for s in r.get("fib",{}).get("buy_signals",[]))
+                r["buy_reasons"].append(f"費波南[{fib_ids}]")
+            if has_ut:
+                r["buy_reasons"].append(f"UT Bot(追蹤線={ut_trail:.1f})")
+            if has_wr:
+                wr_ids = " ".join(s["id"] for s in r.get("wr",{}).get("buy_signals",[]))
+                r["buy_reasons"].append(f"威廉[{wr_ids}]")
+            if has_div:
+                r["buy_reasons"].append(f"背離({div.get('score',0)}分)")
+            results.append(r)
+
+    results.sort(key=lambda x: (
+        -(x.get("confirm") or {}).get("score", 0),
+        -x.get("change_pct", 0),
+    ))
+    return jsonify(sanitize({"data":results,"total":len(cached),"hit_count":len(results),"mode":mode,
+                    "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+@app.route("/api/scan/divergence", methods=["GET"])
+def api_scan_divergence():
+    div_type  = request.args.get("type","all")
+    min_score = int(request.args.get("min_score",2))
+    with cache_lock: cached = list(cache.values())
+    if not cached:
+        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0}), 400
+
+    def calc_div_for(r):
+        sid = r.get("id"); ex = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
+        try:
+            hist = fetch_history(sid, ex=ex)
+            if len(hist) < 30: return r, {}, {}
+            closes  = hist["Close"]; volumes = hist["Volume"]
+            highs   = hist["High"]  if "High" in hist.columns else closes
+            lows_s  = hist["Low"]   if "Low"  in hist.columns else closes
+            ind = calc_all_indicators(closes, highs, lows_s, volumes)
+            div = calc_divergence_signals(ind, closes, highs, lows_s, volumes,
+                                           lookback=120, max_bars=15)
+            n = len(closes)
+            extra = {}
+            if n >= 14:
+                c_v = closes.values
+                ma5_y  = float(c_v[max(0,n-6):n-1].mean())
+                ma10_y = float(c_v[max(0,n-11):n-1].mean())
+                c_y    = float(c_v[-2])
+                c_now  = float(c_v[-1])
+                opens  = hist["Open"] if "Open" in hist.columns else closes
+                o_v    = opens.values
+                o_8    = float(o_v[-9])  if n >= 9  else None
+                o_13   = float(o_v[-14]) if n >= 14 else None
+                extra  = {"cond_ma": (c_y<=ma5_y) or (c_y<=ma10_y),
+                          "cond_fib_break": bool(o_8 and c_now>=o_8 and o_13 and c_now>=o_13)}
+            return r, div, extra
+        except: return r, {}, {}
+
+    hits_raw = []
+    futures  = {_global_executor.submit(calc_div_for, r): r for r in cached}
+    for future in as_completed(futures):
+        try:
+            r, div, extra = future.result()
+            score   = div.get("score",0)
+            signals = list(div.get("buy_signals",[]))
+            if score < min_score or not signals: continue
+            cond_ma  = extra.get("cond_ma",False)
+            cond_str = (score>=6) or (div.get("regular_count",0)>=3) or extra.get("cond_fib_break",False)
+            if not (cond_ma and cond_str): continue
+            if div_type=="regular":
+                signals = [s for s in signals if s["type"]=="regular"]
+            elif div_type=="hidden":
+                signals = [s for s in signals if s["type"]=="hidden"]
+            if not signals: continue
+
+            sid = r.get("id")
+            if sid:
+                with cache_lock:
+                    if sid in cache:
+                        cache[sid]["div"] = div
+
+            hits_raw.append({**r,"div":div,"div_score":score,
+                "div_summary":div.get("summary",""),"div_signals":signals,
+                "regular_count":div.get("regular_count",0),
+                "hidden_count":div.get("hidden_count",0),"filter_detail":extra})
+        except: pass
+
+    hits_raw.sort(key=lambda x:(-x.get("div_score",0),-(x.get("confirm") or {}).get("score",0)))
+    return jsonify(sanitize({"data":hits_raw,"total":len(cached),"hit_count":len(hits_raw),
+        "regular_count":sum(1 for h in hits_raw if h.get("regular_count",0)>0),
+        "hidden_count":sum(1 for h in hits_raw if h.get("hidden_count",0)>0),
+        "div_type":div_type,"min_score":min_score,
+        "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    now = datetime.now()
+    return jsonify({"time":now.strftime("%H:%M:%S"),"date":now.strftime("%Y-%m-%d"),
+        "market_open":(9<=now.hour<13) or (now.hour==13 and now.minute<=30),
+        "watchlist_count":len(watchlist),"shioaji_ready":_sj_ready,
+        "quote_source":"永豐即時" if _sj_ready else "TWSE延遲20分",
+        "preload_done":preload_done,"hist_cached":len(hist_cache),
+        "full_loaded":full_list_loaded,"scan_cache":len(cache)})
+
+@app.route("/api/cache/clear", methods=["GET","POST"])
+def api_cache_clear():
+    global hist_cache
+    with hist_cache_lock: hist_cache = {}
+    with cache_lock: cache.clear()
+    for f in [HIST_CACHE_FILE, SCAN_CACHE_FILE]:
+        try:
+            if os.path.exists(f): os.remove(f)
+        except: pass
+    return jsonify({"ok":True,"msg":"快取已清除"})
+
+@app.route("/api/stocklist/status", methods=["GET"])
+def api_stocklist_status():
+    return jsonify({"full_loaded":full_list_loaded,"total_stocks":len(watchlist),
+        "cache_count":len(cache),"hist_cached":len(hist_cache)})
+
+@app.route("/api/scheduler/start", methods=["POST"])
+def api_scheduler_start():
+    global scheduler_running, scheduler_interval
+    data = request.json or {}
+    scheduler_interval = int(data.get("interval",30))
+    if scheduler_running: return jsonify({"ok":False,"msg":"排程已在執行"})
+    scheduler_running = True
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    send_telegram(f"✅ <b>選股系統已啟動</b>\n⏱ 每{scheduler_interval}分鐘掃描\n📊 監控{len(watchlist)}支")
+    return jsonify({"ok":True,"msg":f"排程已啟動，每{scheduler_interval}分鐘"})
+
+@app.route("/api/scheduler/stop", methods=["POST"])
+def api_scheduler_stop():
+    global scheduler_running
+    scheduler_running = False
+    return jsonify({"ok":True,"msg":"排程已停止"})
+
+@app.route("/api/scheduler/status", methods=["GET"])
+def api_scheduler_status():
+    return jsonify({"running":scheduler_running,"interval":scheduler_interval})
+
+@app.route("/api/backtest", methods=["POST"])
+def api_backtest():
+    data = request.json
+    sid  = data.get("stock_id","2330").strip(); ex = data.get("ex","tse")
+    strategy_ids = data.get("strategies",["S1","S2","S3","S4","S5","S6"])
+    hold_days = int(data.get("hold_days",10)); stop_pct = float(data.get("stop_pct",0.07))
+    try:
+        df = fetch_history(sid, period="1y", ex=ex)
+        if len(df) < 60: return jsonify({"error":f"{sid} 歷史資料不足"}), 400
+        closes = df["Close"]; volumes = df["Volume"]
+        highs  = df["High"] if "High" in df.columns else closes
+        lows   = df["Low"]  if "Low"  in df.columns else closes
+        all_trades = []; strat_summary = []
+        for strat_id in strategy_ids:
+            sig_arr = []
+            for i in range(65, len(closes)):
+                cs = closes.iloc[:i+1]; vs = volumes.iloc[:i+1]
+                hs = highs.iloc[:i+1];  ls = lows.iloc[:i+1]
+                ind_i = calc_all_indicators(cs, hs, ls, vs)
+                triggered = eval_strategies(ind_i, cs, vs)
+                sig_arr.append(any(t["id"]==strat_id for t in triggered))
+            trades = []; in_t = False; ep = 0.0; ed = None; dh = 0
+            px = closes.values; dt = closes.index; so = 65
+            for i in range(so, len(px)):
+                si = i - so
+                if in_t:
+                    dh += 1
+                    if px[i] <= ep*(1-stop_pct):
+                        pnl = (px[i]-ep)/ep*100
+                        trades.append({"策略":strat_id,"進場日":str(ed.date()),"出場日":str(dt[i].date()),
+                            "進場價":round(ep,2),"出場價":round(float(px[i]),2),
+                            "報酬率%":round(pnl,2),"出場原因":"停損","持有天數":dh})
+                        in_t = False
+                    elif dh >= hold_days:
+                        pnl = (px[i]-ep)/ep*100
+                        trades.append({"策略":strat_id,"進場日":str(ed.date()),"出場日":str(dt[i].date()),
+                            "進場價":round(ep,2),"出場價":round(float(px[i]),2),
+                            "報酬率%":round(pnl,2),"出場原因":"到期","持有天數":dh})
+                        in_t = False
+                elif si < len(sig_arr) and sig_arr[si]:
+                    in_t = True; ep = float(px[i]); ed = dt[i]; dh = 0
+            if not trades:
+                strat_summary.append({"策略":strat_id,"交易次數":0,"勝率%":0,"平均報酬%":0,
+                    "最大獲利%":0,"最大虧損%":0,"總報酬%":0,"盈虧比":0})
+                continue
+            all_trades.extend(trades)
+            wins   = [t for t in trades if t["報酬率%"]>0]
+            losses = [t for t in trades if t["報酬率%"]<=0]
+            aw = sum(t["報酬率%"] for t in wins)/len(wins)     if wins   else 0
+            al = sum(t["報酬率%"] for t in losses)/len(losses) if losses else 0
+            strat_summary.append({"策略":strat_id,"交易次數":len(trades),
+                "勝率%":round(len(wins)/len(trades)*100,1),
+                "平均報酬%":round(sum(t["報酬率%"] for t in trades)/len(trades),2),
+                "最大獲利%":round(max(t["報酬率%"] for t in trades),2),
+                "最大虧損%":round(min(t["報酬率%"] for t in trades),2),
+                "總報酬%":round(sum(t["報酬率%"] for t in trades),2),
+                "盈虧比":round(abs(aw/al),2) if al!=0 else 0})
+        return jsonify({"stock_id":sid,"hold_days":hold_days,"stop_pct":stop_pct*100,
+            "period":"1年","summary":strat_summary,"trades":all_trades,"total_trades":len(all_trades)})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/debug/<sid>", methods=["GET"])
+def api_debug(sid):
+    ex = request.args.get("ex","tse")
+    rt = fetch_realtime_price(sid, ex)
+    hist = fetch_history(sid, ex=ex)
+    return jsonify({"rt":rt,"has_history":len(hist)>=30,"hist_rows":len(hist),
+        "hist_last_date":str(hist.index[-1].date()) if len(hist)>0 else None,
+        "hist_cached":bool(_get_hist_cache(_hist_key(sid,"3mo",ex)))})
+
+@app.route("/")
+def index():
+    try:
+        return render_template_string(open("index.html", encoding="utf-8").read())
+    except:
+        return "<h2>index.html 不存在</h2>", 404
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 啟動序列
+# ══════════════════════════════════════════════════════════
+def startup_sequence():
+    print("  🚀 啟動序列開始...")
+    fast_warmup()                  # ★ numba 預編譯
+    _load_delisted()
+    load_full_stock_list()
+    warm_up_cache()
+    _save_delisted()
+    print("  🎉 啟動完成！可以開始掃描。")
+
+threading.Thread(target=startup_sequence, daemon=True).start()
+
+if __name__ == "__main__":
+    print("""
+╔══════════════════════════════════════════════════════╗
+║   盤中選股系統（極速版 v2）啟動中...                 ║
+║   瀏覽器開啟：http://localhost:5000                  ║
+║                                                      ║
+║   優化新增：                                         ║
+║   ✅ numba JIT（UT Bot/Pivot 加速 10-50x）           ║
+║   ✅ 預擷取 numpy（去除 .iloc 開銷）                 ║
+║   ✅ 移除 pd.concat 單列附加                         ║
+║   ✅ 批次平行下載（TSE+OTC 混合）                    ║
+║   ✅ 主掃描預先補齊歷史                              ║
+╚══════════════════════════════════════════════════════╝
+    """)
+    app.run(host="0.0.0.0", port=5000, debug=False)
