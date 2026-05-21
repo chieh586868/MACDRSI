@@ -154,29 +154,44 @@ def save_hist_cache_disk():
         print(f"  ⚠ 快取存檔失敗: {e}")
 
 
-def batch_preload():
+def _batch_download(stocks: list, period: str, label: str = "") -> int:
     """
-    ★ 全部批次平行（TSE+OTC 一起，不再 TSE 完才換 OTC）
+    對指定期間批次下載歷史，跳過已快取者。
+    被 batch_preload(3mo) 與 ensure_1y_cached() 共用。
     """
-    global preload_done
-    if load_hist_cache_disk():
-        preload_done = True
-        print(f"  🎉 就緒（快取命中）！{len(watchlist)} 支股票可掃描")
-        return
+    if not stocks:
+        return 0
 
-    stocks = list(watchlist)
-    total  = len(stocks)
-    print(f"  🔄 首次預載 {total} 支歷史資料（之後啟動不需要）...")
+    # 找出真正缺漏的
+    missing = []
+    for s in stocks:
+        key = f"{s['id']}_{period}_1d_{s.get('ex','tse')}"
+        with hist_lock:
+            entry = hist_cache.get(key)
+        if entry is not None and (time.time() - entry["ts"]) < HIST_TTL:
+            continue
+        with _del_lock:
+            if s["id"] in _delisted_set:
+                continue
+        missing.append(s)
+
+    if not missing:
+        return 0
+
+    total = len(missing)
+    lbl = label or period
+    print(f"  🔄 批次下載 {lbl} 歷史：{total} 支...")
     t0 = time.time()
     loaded = [0]
     lock   = threading.Lock()
+    min_bars = 60 if period == "1y" else 25
 
     def dl_batch(batch, suffix, ex_name):
         if not batch:
             return
         tickers = " ".join(f"{s['id']}{suffix}" for s in batch)
         try:
-            raw = yf.download(tickers, period="3mo", group_by="ticker",
+            raw = yf.download(tickers, period=period, group_by="ticker",
                               progress=False, auto_adjust=True, threads=True)
             single = len(batch) == 1
             cols0 = None if single else raw.columns.get_level_values(0)
@@ -192,8 +207,8 @@ def batch_preload():
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
                     df = df.dropna()
-                    if len(df) >= 25:
-                        key = f"{s['id']}_3mo_1d_{ex_name}"
+                    if len(df) >= min_bars:
+                        key = f"{s['id']}_{period}_1d_{ex_name}"
                         with hist_lock:
                             hist_cache[key] = {"df": df, "ts": time.time()}
                         with lock:
@@ -202,13 +217,13 @@ def batch_preload():
                     pass
         except Exception:
             for s in batch:
-                df = get_hist(s["id"], ex_name)
+                df = get_hist(s["id"], s.get("ex", "tse"), period=period)
                 if not df.empty:
                     with lock:
                         loaded[0] += 1
 
-    tse = [s for s in stocks if s.get("ex", "tse") == "tse"]
-    otc = [s for s in stocks if s.get("ex", "tse") == "otc"]
+    tse = [s for s in missing if s.get("ex", "tse") == "tse"]
+    otc = [s for s in missing if s.get("ex", "tse") == "otc"]
     BSIZ = 40
     tasks = []
     for i in range(0, len(tse), BSIZ):
@@ -222,7 +237,40 @@ def batch_preload():
         print(f"  批次 {done}/{len(tasks)} 完成（已載入 {loaded[0]} 支）...", end="\r")
 
     elapsed = round(time.time() - t0, 1)
-    print(f"\n  ✅ 預載完成：{loaded[0]}/{total} 支，{elapsed} 秒")
+    print(f"\n  ✅ {lbl} 載入完成：{loaded[0]}/{total} 支，{elapsed} 秒")
+    return loaded[0]
+
+
+# ── 1y 快取補齊（dw 掃描需要）────────────────────────────
+_1y_loaded = False
+_1y_lock   = threading.Lock()
+
+def ensure_1y_cached():
+    """確保所有股票的 1y 歷史已快取；dw 掃描前呼叫"""
+    global _1y_loaded
+    with _1y_lock:
+        if _1y_loaded:
+            return
+        loaded = _batch_download(list(watchlist), period="1y", label="1y")
+        if loaded > 0:
+            save_hist_cache_disk()
+        _1y_loaded = True
+
+
+def batch_preload():
+    """★ 啟動時預載 3mo 歷史（dw 模式需要的 1y 另外懶載入）"""
+    global preload_done, _1y_loaded
+    if load_hist_cache_disk():
+        preload_done = True
+        # 磁碟快取若含 1y，跳過二次下載
+        with hist_lock:
+            if any(k.endswith("_1y_1d_tse") or k.endswith("_1y_1d_otc")
+                   for k in hist_cache):
+                _1y_loaded = True
+        print(f"  🎉 就緒（快取命中）！{len(watchlist)} 支股票可掃描")
+        return
+
+    _batch_download(list(watchlist), period="3mo", label="3mo")
     save_hist_cache_disk()
     preload_done = True
     print(f"  🎉 就緒！{len(watchlist)} 支股票可掃描")
@@ -642,6 +690,10 @@ def run_dw_scan(mode="triple", min_weekly=2):
     global scan_progress
     stocks = list(watchlist); total = len(stocks)
     label  = "日週強烈共振" if mode == "resonance" else "三指標全部背離+日週雙重"
+
+    # ★ 關鍵修正：dw 掃描需要 1y 歷史，先批次補齊（一次性、之後 hit 快取）
+    ensure_1y_cached()
+
     scan_progress = {"done": 0, "total": total, "running": True, "mode": mode}
     print(f"\n  🔍 {label}掃描：{total} 支...")
     t0 = time.time(); results = []
