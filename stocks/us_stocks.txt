@@ -1,0 +1,21 @@
+# 美國股票清單
+# 科技
+AAPL
+MSFT
+NVDA
+GOOGL
+META
+AMZN
+TSLA
+AMD
+INTC
+# 金融
+JPM
+BAC
+GS
+# 醫療
+JNJ
+PFE
+# ETF
+SPY
+QQQ
