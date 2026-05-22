@@ -1576,10 +1576,8 @@ def startup():
     incremental_refresh()  # ★ 自動偵測快取，必要時補最近 10 天
 
 
-threading.Thread(target=startup, daemon=True).start()
-
-
 if __name__ == "__main__":
+    threading.Thread(target=startup, daemon=True).start()
     print("""
 ╔══════════════════════════════════════════════════════╗
 ║   指標背離選股系統 v2（極速版） 日K / 週K 雙模式     ║
