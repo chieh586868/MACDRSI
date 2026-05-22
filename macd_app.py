@@ -1643,6 +1643,12 @@ def api_scan_buysignal():
                          has_wr and
                          not_falling and above_short_ma and
                          confirm_score > 3)
+        elif mode == "D":
+            div_score    = div.get("score", 0)
+            regular_cnt  = div.get("regular_count", 0)
+            triggered = (has_div and
+                         (div_score >= 4 or regular_cnt >= 1) and
+                         not_falling)
         else:
             triggered = (has_ut and ut_above_trail and
                          has_fib and fib_above_ma and
@@ -1663,10 +1669,17 @@ def api_scan_buysignal():
                 r["buy_reasons"].append(f"背離({div.get('score',0)}分)")
             results.append(r)
 
-    results.sort(key=lambda x: (
-        -(x.get("confirm") or {}).get("score", 0),
-        -x.get("change_pct", 0),
-    ))
+    if mode == "D":
+        results.sort(key=lambda x: (
+            -(x.get("div") or {}).get("score", 0),
+            -(x.get("div") or {}).get("regular_count", 0),
+            -x.get("change_pct", 0),
+        ))
+    else:
+        results.sort(key=lambda x: (
+            -(x.get("confirm") or {}).get("score", 0),
+            -x.get("change_pct", 0),
+        ))
     return jsonify(sanitize({"data":results,"total":len(cached),"hit_count":len(results),"mode":mode,
                     "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
