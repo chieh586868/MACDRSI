@@ -1337,24 +1337,40 @@ def fetch_otc_stock_list():
 industry_map = {}
 industry_lock = threading.Lock()
 
-# 預設排除產業（傳統 / 景氣循環股）
-DEFAULT_EXCLUDED_INDUSTRIES = {
-    "水泥工業","塑膠工業","紡織纖維","建材營造","航運業",
-    "造紙工業","觀光餐旅","觀光事業","橡膠工業"
-}
+# 預設排除產業關鍵字（用「包含」比對，不需要完整名稱一致）
+DEFAULT_EXCLUDED_KEYWORDS = (
+    "水泥","塑膠","紡織","建材","營造",
+    "航運","海運","造紙","觀光","餐旅","橡膠"
+)
+
+def is_excluded_industry(ind_name: str) -> bool:
+    if not ind_name: return False
+    return any(k in ind_name for k in DEFAULT_EXCLUDED_KEYWORDS)
+
+# 向下相容（其他地方還在用 set）
+DEFAULT_EXCLUDED_INDUSTRIES = set()  # 已被 is_excluded_industry 取代
 
 def _extract_industry_field(x: dict) -> str:
-    """嘗試多個可能的欄位名稱"""
+    # 先試已知 key，再 fuzzy 找含「產業」或 "industry" 的欄位
     for k in ("產業類別","SubIndustryCategory","產業別","IndustryCategory",
              "Category","產業","SubIndustry"):
         v = x.get(k)
         if v: return str(v).strip()
+    for k, v in x.items():
+        kl = str(k).lower()
+        if (("產業" in str(k)) or ("industry" in kl) or ("category" in kl)) and v:
+            return str(v).strip()
     return ""
 
 def _extract_sid_field(x: dict) -> str:
     for k in ("公司代號","SecuritiesCompanyCode","CompanyCode","Code","股票代號"):
         v = x.get(k)
         if v: return str(v).strip()
+    for k, v in x.items():
+        kl = str(k).lower()
+        if (("代號" in str(k)) or ("code" in kl)) and v:
+            s = str(v).strip()
+            if s.isdigit() and 3 <= len(s) <= 6: return s
     return ""
 
 def fetch_industry_map():
@@ -1386,7 +1402,9 @@ def fetch_industry_map():
             sid = _extract_sid_field(x)
             ind = _extract_industry_field(x)
             if sid and ind: out[sid] = ind
+        sample = arr[0] if arr else {}
         print(f"  · TWSE 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔")
+        if arr: print(f"    範例: {dict(list(sample.items())[:5])}")
     except Exception as e:
         print(f"  ⚠ TWSE 產業資料失敗: {e}")
     # 上櫃
@@ -1399,7 +1417,9 @@ def fetch_industry_map():
             sid = _extract_sid_field(x)
             ind = _extract_industry_field(x)
             if sid and ind: out[sid] = ind
+        sample = arr[0] if arr else {}
         print(f"  · TPEx 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔")
+        if arr: print(f"    範例: {dict(list(sample.items())[:8])}")
     except Exception as e:
         print(f"  ⚠ TPEx 產業資料失敗: {e}")
     if len(out) > 100:
@@ -1410,7 +1430,7 @@ def fetch_industry_map():
             print(f"  ⚠ 寫 cache 失敗: {e}")
         with industry_lock: industry_map = out
         # 列出排除產業在 map 裡的數量
-        excl_count = sum(1 for v in out.values() if v in DEFAULT_EXCLUDED_INDUSTRIES)
+        excl_count = sum(1 for v in out.values() if is_excluded_industry(v))
         print(f"  ✅ 產業 map：{len(out)} 檔（預設排除產業命中 {excl_count} 檔）")
     else:
         print(f"  ❌ 產業 map 抓取失敗，僅 {len(out)} 檔。產業過濾將失效（但 MA 緊纏過濾仍生效）")
@@ -1718,7 +1738,7 @@ def api_scan_buysignal():
         if r.get("volume",0) < 20: continue
         if exclude_traditional:
             ind = industry_map.get(r.get("id",""), "")
-            if ind in DEFAULT_EXCLUDED_INDUSTRIES: continue
+            if is_excluded_industry(ind): continue
 
         has_fib = bool(r.get("fib",{}).get("buy_signals"))
         has_ut  = bool(r.get("ut_buy"))
@@ -1917,7 +1937,7 @@ def api_scan_condition_d():
 
     def _ind_ok(sid):
         if not exclude_traditional: return True
-        return industry_map.get(sid, "") not in DEFAULT_EXCLUDED_INDUSTRIES
+        return not is_excluded_industry(industry_map.get(sid, ""))
 
     candidates = [r for r in cached
                   if (r.get("div") or {}).get("score", 0) >= 2
@@ -2235,7 +2255,7 @@ def api_why(sid):
     if not r:
         return jsonify({"error":f"{sid} 不在 cache，請先跑掃描","sid":sid}), 404
     ind = industry_map.get(sid, "(未知)")
-    industry_excluded = ind in DEFAULT_EXCLUDED_INDUSTRIES
+    industry_excluded = is_excluded_industry(ind)
     has_fib = bool(r.get("fib",{}).get("buy_signals"))
     has_ut  = bool(r.get("ut_buy"))
     has_wr  = bool(r.get("wr",{}).get("buy_signals"))
