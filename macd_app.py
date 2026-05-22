@@ -1297,8 +1297,9 @@ def batch_scan_all(batch_size: int = 100, delay: float = 0.0,
     elapsed = round(time.time() - t0, 1)
     print(f"\n  ✅ {mode_str}掃描完成：{len(results)}/{total} 支,{signals_found} 個訊號，{elapsed} 秒")
 
-    # ★ 完整模式掃完後存盤，下次啟動可直接 fast mode
-    if not fast_mode and len(results) >= 100:
+    # ★ 掃描結果存盤（不論 mode）。下次啟動可直接 fast mode
+    #   存盤條件：結果 >= 100 筆才存（避免空跑）
+    if len(results) >= 100:
         threading.Thread(target=_save_scan_cache_disk, daemon=True).start()
 
     return results
