@@ -1343,46 +1343,77 @@ DEFAULT_EXCLUDED_INDUSTRIES = {
     "造紙工業","觀光餐旅","觀光事業","橡膠工業"
 }
 
+def _extract_industry_field(x: dict) -> str:
+    """嘗試多個可能的欄位名稱"""
+    for k in ("產業類別","SubIndustryCategory","產業別","IndustryCategory",
+             "Category","產業","SubIndustry"):
+        v = x.get(k)
+        if v: return str(v).strip()
+    return ""
+
+def _extract_sid_field(x: dict) -> str:
+    for k in ("公司代號","SecuritiesCompanyCode","CompanyCode","Code","股票代號"):
+        v = x.get(k)
+        if v: return str(v).strip()
+    return ""
+
 def fetch_industry_map():
     """從 TWSE / TPEx 拿產業類別，建 dict[sid -> 產業名稱]。7 天 cache。"""
     global industry_map
+    print(f"  📂 載入產業 map...")
     if os.path.exists(INDUSTRY_FILE):
         try:
-            if (time.time() - os.path.getmtime(INDUSTRY_FILE)) < 7*86400:
+            age_days = (time.time() - os.path.getmtime(INDUSTRY_FILE)) / 86400
+            if age_days < 7:
                 with open(INDUSTRY_FILE,"r",encoding="utf-8") as f:
                     data = json.load(f)
                 if len(data) > 100:
                     with industry_lock: industry_map = data
-                    print(f"  ✅ 產業 map cache：{len(data)} 檔"); return
-        except: pass
+                    print(f"  ✅ 產業 map 從 cache 載入：{len(data)} 檔（{age_days:.1f} 天前）"); return
+                print(f"  ⚠ cache 內容過少（{len(data)} 檔），重抓")
+            else:
+                print(f"  ⏰ cache 過期（{age_days:.1f} 天），重抓")
+        except Exception as e:
+            print(f"  ⚠ 讀 cache 失敗: {e}")
     out = {}
     # 上市
     try:
-        r = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-                         timeout=15, headers={"User-Agent":"Mozilla/5.0"})
-        for x in r.json():
-            sid = str(x.get("公司代號",""))
-            ind = str(x.get("產業類別","")).strip()
+        url = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+        r = requests.get(url, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        arr = r.json() if r.status_code == 200 else []
+        n_before = len(out)
+        for x in arr:
+            sid = _extract_sid_field(x)
+            ind = _extract_industry_field(x)
             if sid and ind: out[sid] = ind
+        print(f"  · TWSE 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔")
     except Exception as e:
         print(f"  ⚠ TWSE 產業資料失敗: {e}")
     # 上櫃
     try:
-        r = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
-                         timeout=15, headers={"User-Agent":"Mozilla/5.0"})
-        for x in r.json():
-            sid = str(x.get("SecuritiesCompanyCode") or x.get("公司代號") or "")
-            ind = str(x.get("SubIndustryCategory") or x.get("產業別") or "").strip()
+        url = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+        r = requests.get(url, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        arr = r.json() if r.status_code == 200 else []
+        n_before = len(out)
+        for x in arr:
+            sid = _extract_sid_field(x)
+            ind = _extract_industry_field(x)
             if sid and ind: out[sid] = ind
+        print(f"  · TPEx 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔")
     except Exception as e:
         print(f"  ⚠ TPEx 產業資料失敗: {e}")
     if len(out) > 100:
         try:
             with open(INDUSTRY_FILE,"w",encoding="utf-8") as f:
                 json.dump(out, f, ensure_ascii=False)
-        except: pass
+        except Exception as e:
+            print(f"  ⚠ 寫 cache 失敗: {e}")
         with industry_lock: industry_map = out
-        print(f"  ✅ 產業 map：{len(out)} 檔")
+        # 列出排除產業在 map 裡的數量
+        excl_count = sum(1 for v in out.values() if v in DEFAULT_EXCLUDED_INDUSTRIES)
+        print(f"  ✅ 產業 map：{len(out)} 檔（預設排除產業命中 {excl_count} 檔）")
+    else:
+        print(f"  ❌ 產業 map 抓取失敗，僅 {len(out)} 檔。產業過濾將失效（但 MA 緊纏過濾仍生效）")
 
 
 def load_full_stock_list():
