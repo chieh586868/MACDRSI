@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>選股系統</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Microsoft JhengHei', 'Noto Sans TC', sans-serif;
+  background: #0d1117; color: #e6edf3; padding: 16px; font-size: 14px;
+}
+
+/* HEADER */
+.hdr {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #30363d;
+}
+.title { font-size: 20px; font-weight: 700; }
+.hdr-right { display: flex; gap: 16px; align-items: center; }
+.pill {
+  font-family: monospace; font-size: 12px; color: #7d8590;
+  padding: 4px 10px; border-radius: 12px; border: 1px solid #30363d;
+}
+.pill.green { color: #3fb950; border-color: #2ea043; }
+
+/* CONTROLS */
+.controls {
+  display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap;
+  align-items: center;
+}
+
+.btn-group { display: flex; gap: 8px; }
+.btn {
+  padding: 10px 28px; font-size: 15px; font-weight: 700;
+  border: none; border-radius: 6px; cursor: pointer; color: white;
+  transition: transform .1s, opacity .1s; letter-spacing: 1px;
+}
+.btn:active { transform: scale(.96); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn-a { background: linear-gradient(135deg, #d97706, #f59e0b); }
+.btn-b { background: linear-gradient(135deg, #dc2626, #ef4444); }
+.btn-c { background: linear-gradient(135deg, #7c3aed, #a855f7); }
+.btn-a:hover { background: linear-gradient(135deg, #b45309, #d97706); }
+.btn-b:hover { background: linear-gradient(135deg, #b91c1c, #dc2626); }
+.btn-c:hover { background: linear-gradient(135deg, #6d28d9, #7c3aed); }
+
+.panel {
+  display: flex; gap: 8px; align-items: center;
+  padding: 8px 14px; background: #161b22; border-radius: 6px;
+  border: 1px solid #30363d;
+}
+.panel-label { color: #7d8590; font-size: 12px; margin-right: 4px; }
+.panel input[type="number"] {
+  width: 60px; background: #0d1117; color: #e6edf3;
+  border: 1px solid #30363d; padding: 4px 8px; border-radius: 4px;
+  font-family: monospace; text-align: center;
+}
+.btn-mini {
+  padding: 6px 14px; font-size: 13px; font-weight: 600;
+}
+.btn-start { background: #22c55e; }
+.btn-stop { background: #6b7280; }
+.btn-test { background: #3b82f6; padding: 6px 12px; font-size: 12px; }
+.dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #6b7280; transition: all .2s;
+}
+.dot.on { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+.dot.off { background: #ef4444; }
+
+/* CHECKBOX */
+.tg-toggle { display: flex; gap: 6px; align-items: center; cursor: pointer; user-select: none; }
+.tg-toggle input { cursor: pointer; }
+
+/* INFO BAR */
+.info-bar {
+  font-size: 13px; color: #7d8590;
+  padding: 8px 0 12px; font-family: monospace;
+}
+.info-bar.ok { color: #3fb950; }
+.info-bar.err { color: #f85149; }
+
+/* TABLE */
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th {
+  background: #161b22; padding: 10px 12px; text-align: left;
+  font-size: 12px; font-weight: 600; color: #7d8590;
+  border-bottom: 2px solid #30363d; letter-spacing: .03em;
+  text-transform: uppercase; position: sticky; top: 0;
+}
+th.r { text-align: right; }
+td {
+  padding: 10px 12px; border-bottom: 1px solid #21262d;
+  font-size: 14px;
+}
+td.r { text-align: right; font-family: monospace; }
+tr:hover { background: #161b22; }
+
+.sid { font-weight: 700; font-family: monospace; font-size: 15px; }
+.up { color: #ef4444; font-weight: 600; }
+.dn { color: #22c55e; font-weight: 600; }
+.flat { color: #7d8590; }
+.price { font-weight: 600; }
+
+/* EMPTY */
+.empty {
+  text-align: center; padding: 80px 20px; color: #484f58;
+  font-size: 14px;
+}
+.empty-big { font-size: 48px; opacity: .3; margin-bottom: 12px; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+.loading { animation: pulse 1.5s infinite; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="hdr">
+  <div class="title">📊 選股系統</div>
+  <div class="hdr-right">
+    <span class="pill" id="time">--:--:--</span>
+    <span class="pill" id="count">載入中...</span>
+    <span class="pill" id="market">--</span>
+  </div>
+</div>
+
+<!-- CONTROLS -->
+<div class="controls">
+  <!-- A / B / C 掃描按鈕 -->
+  <div class="btn-group">
+    <button class="btn btn-a" onclick="scan('A')">條件 A</button>
+    <button class="btn btn-b" onclick="scan('B')">條件 B</button>
+    <button class="btn btn-c" onclick="scan('C')">條件 C</button>
+  </div>
+
+  <!-- 排程器 -->
+  <div class="panel">
+    <span class="dot" id="sched-dot"></span>
+    <span class="panel-label">自動掃描</span>
+    <input type="number" id="interval" value="30" min="1" max="120">
+    <span class="panel-label">分鐘</span>
+    <button class="btn btn-mini btn-start" id="btn-sched-start" onclick="schedStart()">啟動</button>
+    <button class="btn btn-mini btn-stop"  id="btn-sched-stop"  onclick="schedStop()" disabled>停止</button>
+  </div>
+
+  <!-- Telegram -->
+  <div class="panel">
+    <span class="dot" id="tg-dot"></span>
+    <label class="tg-toggle">
+      <input type="checkbox" id="tg-toggle" onchange="tgToggle()">
+      <span>Telegram 通知</span>
+    </label>
+    <button class="btn btn-mini btn-test" onclick="tgTest()">測試</button>
+  </div>
+</div>
+
+<!-- INFO -->
+<div class="info-bar" id="info">點選條件 A / B / C 開始掃描</div>
+
+<!-- TABLE -->
+<div class="tbl-wrap">
+  <table id="tbl" style="display:none">
+    <thead>
+      <tr>
+        <th style="width:50px">#</th>
+        <th style="width:90px">股號</th>
+        <th>名稱</th>
+        <th class="r">現價</th>
+        <th class="r">漲跌</th>
+        <th class="r">漲跌幅</th>
+        <th class="r">成交量</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty">
+    <div class="empty-big">📈</div>
+    尚未掃描，點選條件 A / B / C 開始
+  </div>
+</div>
+
+<script>
+// ── 時鐘 ──
+setInterval(() => {
+  document.getElementById('time').textContent =
+    new Date().toLocaleTimeString('zh-TW');
+}, 1000);
+
+// ── 系統狀態（每 10 秒更新）──
+function refreshStatus() {
+  fetch('/api/status').then(r => r.json()).then(d => {
+    document.getElementById('count').textContent = `${d.watchlist_count} 支股票`;
+    const marketBadge = document.getElementById('market');
+    if (d.market_open) {
+      marketBadge.textContent = '盤中';
+      marketBadge.classList.add('green');
+    } else {
+      marketBadge.textContent = '盤後';
+      marketBadge.classList.remove('green');
+    }
+    // Telegram 狀態
+    const tgDot = document.getElementById('tg-dot');
+    const tgChk = document.getElementById('tg-toggle');
+    if (!d.telegram_configured) {
+      tgDot.classList.remove('on'); tgDot.classList.add('off');
+      tgChk.disabled = true;
+      tgChk.title = '未設定 TELEGRAM_TOKEN 環境變數';
+    } else {
+      tgDot.classList.remove('off');
+      tgDot.classList.toggle('on', d.telegram_enabled);
+      tgChk.checked = d.telegram_enabled;
+      tgChk.disabled = false;
+    }
+  }).catch(() => {});
+}
+refreshStatus();
+setInterval(refreshStatus, 10000);
+
+// ── 排程狀態 ──
+function refreshSched() {
+  fetch('/api/scheduler/status').then(r => r.json()).then(d => {
+    document.getElementById('sched-dot').classList.toggle('on', d.running);
+    document.getElementById('btn-sched-start').disabled = d.running;
+    document.getElementById('btn-sched-stop').disabled = !d.running;
+    if (d.interval) document.getElementById('interval').value = d.interval;
+  }).catch(() => {});
+}
+refreshSched();
+setInterval(refreshSched, 10000);
+
+function schedStart() {
+  const interval = parseInt(document.getElementById('interval').value) || 30;
+  fetch('/api/scheduler/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({interval})
+  }).then(r => r.json()).then(d => {
+    setInfo(d.msg || '排程已啟動', 'ok');
+    refreshSched();
+  });
+}
+
+function schedStop() {
+  fetch('/api/scheduler/stop', {method: 'POST'})
+    .then(r => r.json()).then(d => {
+      setInfo(d.msg || '排程已停止', '');
+      refreshSched();
+    });
+}
+
+// ── Telegram ──
+function tgToggle() {
+  const enabled = document.getElementById('tg-toggle').checked;
+  fetch('/api/telegram/toggle', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled})
+  }).then(r => r.json()).then(d => {
+    setInfo(`Telegram 通知：${d.enabled ? '已啟用' : '已停用'}`, 'ok');
+    refreshStatus();
+  });
+}
+
+function tgTest() {
+  setInfo('測試 Telegram 訊息中...', '');
+  fetch('/api/telegram/test', {method: 'POST'})
+    .then(r => r.json()).then(d => {
+      setInfo(d.msg, d.ok ? 'ok' : 'err');
+    });
+}
+
+// ── 掃描 ──
+function scan(mode) {
+  setBtns(true);
+  document.getElementById('tbl').style.display = 'none';
+  document.getElementById('empty').style.display = 'block';
+  document.getElementById('empty').innerHTML =
+    '<div class="empty-big loading">⏳</div>條件 ' + mode + ' 掃描中...';
+  setInfo(`正在執行條件 ${mode} 掃描，第一次會慢 (~50秒)，之後快...`, '');
+
+  const t0 = Date.now();
+  // 先跑完整掃描（更新 cache + 即時報價）
+  fetch('/api/scan')
+    .then(r => r.json())
+    .then(() => {
+      // 再用條件 mode 過濾
+      return fetch(`/api/scan/buysignal?mode=${mode}`);
+    })
+    .then(r => r.json())
+    .then(data => {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      const rows = data.data || [];
+      setInfo(
+        `✓ 條件 ${mode}：找到 ${rows.length} 支 / 共掃描 ${data.total} 支，耗時 ${elapsed} 秒`,
+        rows.length > 0 ? 'ok' : ''
+      );
+      render(rows);
+    })
+    .catch(e => {
+      setInfo(`✗ 掃描失敗：${e.message}`, 'err');
+    })
+    .finally(() => setBtns(false));
+}
+
+function setBtns(disabled) {
+  document.querySelectorAll('.btn-a, .btn-b, .btn-c').forEach(b => b.disabled = disabled);
+}
+
+function setInfo(msg, type) {
+  const el = document.getElementById('info');
+  el.textContent = msg;
+  el.className = 'info-bar' + (type ? ' ' + type : '');
+}
+
+function render(rows) {
+  if (!rows || !rows.length) {
+    document.getElementById('tbl').style.display = 'none';
+    document.getElementById('empty').style.display = 'block';
+    document.getElementById('empty').innerHTML =
+      '<div class="empty-big">🔇</div>沒有符合條件的股票';
+    return;
+  }
+  document.getElementById('empty').style.display = 'none';
+  document.getElementById('tbl').style.display = 'table';
+
+  const html = rows.map((r, i) => {
+    const pct = r.change_pct || 0;
+    const chg = r.change || 0;
+    const cls = pct > 0 ? 'up' : pct < 0 ? 'dn' : 'flat';
+    const arrow = pct > 0 ? '▲' : pct < 0 ? '▼' : '─';
+    return `<tr>
+      <td>${i+1}</td>
+      <td class="sid">${r.id}</td>
+      <td>${r.name || ''}</td>
+      <td class="r price">${(r.close||0).toFixed(2)}</td>
+      <td class="r ${cls}">${arrow} ${Math.abs(chg).toFixed(2)}</td>
+      <td class="r ${cls}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
+      <td class="r">${formatVol(r.volume)}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('rows').innerHTML = html;
+}
+
+function formatVol(v) {
+  if (!v || v === 0) return '-';
+  if (v >= 100000) return (v/10000).toFixed(0) + '萬';
+  if (v >= 10000)  return (v/10000).toFixed(1) + '萬';
+  return v.toString();
+}
+</script>
+</body>
+</html>

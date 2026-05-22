@@ -1401,8 +1401,10 @@ load_watchlist2()
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+telegram_enabled = True   # ★ UI 可動態開關（不需重啟）
 
 def send_telegram(msg):
+    if not telegram_enabled: return False
     if not TELEGRAM_TOKEN: return False
     try:
         r = requests.post(TELEGRAM_API, json={"chat_id":TELEGRAM_CHAT_ID,
@@ -1748,7 +1750,25 @@ def api_status():
         "watchlist_count":len(watchlist),"shioaji_ready":_sj_ready,
         "quote_source":"永豐即時" if _sj_ready else "TWSE延遲20分",
         "preload_done":preload_done,"hist_cached":len(hist_cache),
-        "full_loaded":full_list_loaded,"scan_cache":len(cache)})
+        "full_loaded":full_list_loaded,"scan_cache":len(cache),
+        "telegram_configured": bool(TELEGRAM_TOKEN),
+        "telegram_enabled": telegram_enabled})
+
+@app.route("/api/telegram/toggle", methods=["POST"])
+def api_telegram_toggle():
+    global telegram_enabled
+    data = request.json or {}
+    if "enabled" in data:
+        telegram_enabled = bool(data["enabled"])
+    return jsonify({"ok": True, "enabled": telegram_enabled,
+                    "configured": bool(TELEGRAM_TOKEN)})
+
+@app.route("/api/telegram/test", methods=["POST"])
+def api_telegram_test():
+    if not TELEGRAM_TOKEN:
+        return jsonify({"ok": False, "msg": "未設定 TELEGRAM_TOKEN 環境變數"}), 400
+    ok = send_telegram(f"🧪 測試訊息\n時間：{datetime.now().strftime('%H:%M:%S')}")
+    return jsonify({"ok": ok, "msg": "已送出" if ok else "送出失敗（看 cmd 錯誤）"})
 
 @app.route("/api/cache/clear", methods=["GET","POST"])
 def api_cache_clear():
