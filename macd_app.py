@@ -1129,8 +1129,12 @@ def analyze_stock(stock: dict) -> dict:
         confirm  = calc_confirm_score(ind, closes, volumes)
         fib_res  = calc_fibonacci_signals(closes, opens_s, highs, lows_s, ind)
         wr_res   = calc_williams_signals_v4(closes, highs, lows_s, ind=ind)
-        div_res  = {"buy_signals":[],"score":0,"summary":"","macd_div":{},"rsi_div":{},
-                    "kd_div":{},"regular_count":0,"hidden_count":0}
+        try:
+            div_res = calc_divergence_signals(ind, closes, highs, lows_s, volumes,
+                                                lookback=120, max_bars=15)
+        except Exception:
+            div_res = {"buy_signals":[],"score":0,"summary":"","macd_div":{},"rsi_div":{},
+                       "kd_div":{},"regular_count":0,"hidden_count":0}
 
         ut_buy_v   = ind["ut_buy"].values
         ut_sell_v  = ind["ut_sell"].values

@@ -47,6 +47,18 @@ body {
 .btn-c:hover { background: linear-gradient(135deg, #6d28d9, #7c3aed); }
 .btn-d:hover { background: linear-gradient(135deg, #0e7490, #0891b2); }
 
+/* 過濾按鈕（不重新掃描，只用已掃描結果） */
+.btn-filter {
+  padding: 6px 16px; font-size: 13px; font-weight: 600;
+  background: #1f6feb; color: white;
+}
+.btn-filter:hover { background: #1f6feb99; }
+.filter-row {
+  display: flex; gap: 6px; align-items: center;
+  margin-top: 10px; flex-wrap: wrap;
+}
+.filter-label { color: #7d8590; font-size: 12px; margin-right: 4px; }
+
 .panel {
   display: flex; gap: 8px; align-items: center;
   padding: 8px 14px; background: #161b22; border-radius: 6px;
@@ -161,8 +173,17 @@ tr:hover { background: #161b22; }
   </div>
 </div>
 
+<!-- 再過濾按鈕（不重新掃描）-->
+<div class="filter-row">
+  <span class="filter-label">已掃描結果再過濾：</span>
+  <button class="btn btn-mini btn-filter" onclick="filter('A')">A</button>
+  <button class="btn btn-mini btn-filter" onclick="filter('B')">B</button>
+  <button class="btn btn-mini btn-filter" onclick="filter('C')">C</button>
+  <button class="btn btn-mini btn-filter" onclick="filter('D')">D</button>
+</div>
+
 <!-- INFO -->
-<div class="info-bar" id="info">點選條件 A / B / C 開始掃描</div>
+<div class="info-bar" id="info">點選條件 A / B / C / D 開始掃描</div>
 
 <!-- TABLE -->
 <div class="tbl-wrap">
@@ -310,7 +331,27 @@ function scan(mode) {
 }
 
 function setBtns(disabled) {
-  document.querySelectorAll('.btn-a, .btn-b, .btn-c, .btn-d').forEach(b => b.disabled = disabled);
+  document.querySelectorAll('.btn-a, .btn-b, .btn-c, .btn-d, .btn-filter').forEach(b => b.disabled = disabled);
+}
+
+// 只用已掃描結果再過濾，不重新跑 /api/scan
+function filter(mode) {
+  setBtns(true);
+  setInfo(`過濾條件 ${mode} 中...`, '');
+  const t0 = Date.now();
+  fetch(`/api/scan/buysignal?mode=${mode}`)
+    .then(r => r.json())
+    .then(data => {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      const rows = data.data || [];
+      setInfo(
+        `✓ 過濾 ${mode}：找到 ${rows.length} 支 / 共 ${data.total} 支，耗時 ${elapsed} 秒`,
+        rows.length > 0 ? 'ok' : ''
+      );
+      render(rows);
+    })
+    .catch(e => setInfo(`✗ 過濾失敗：${e.message}`, 'err'))
+    .finally(() => setBtns(false));
 }
 
 function setInfo(msg, type) {
