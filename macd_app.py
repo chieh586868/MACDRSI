@@ -1350,16 +1350,35 @@ def is_excluded_industry(ind_name: str) -> bool:
 # 向下相容（其他地方還在用 set）
 DEFAULT_EXCLUDED_INDUSTRIES = set()  # 已被 is_excluded_industry 取代
 
+_INDUSTRY_CODE_MAP = {
+    "01":"水泥工業","02":"食品工業","03":"塑膠工業","04":"紡織纖維",
+    "05":"電機機械","06":"電器電纜","08":"玻璃陶瓷","09":"造紙工業",
+    "10":"鋼鐵工業","11":"橡膠工業","12":"汽車工業","14":"建材營造",
+    "15":"航運業","16":"觀光餐旅","17":"金融保險","18":"貿易百貨",
+    "20":"其他","21":"化學工業","22":"生技醫療","23":"油電燃氣",
+    "24":"半導體業","25":"電腦及週邊設備","26":"光電業","27":"通信網路",
+    "28":"電子零組件","29":"電子通路","30":"資訊服務","31":"其他電子",
+    "32":"文化創意","33":"農業科技","34":"電子商務",
+}
+
+def _normalize_industry(v: str) -> str:
+    """純數字 1-2 位 → 用 code 對照；否則回原字串"""
+    if not v: return ""
+    s = str(v).strip()
+    if s.isdigit() and len(s) <= 2:
+        return _INDUSTRY_CODE_MAP.get(s.zfill(2), s)
+    return s
+
 def _extract_industry_field(x: dict) -> str:
     # 先試已知 key，再 fuzzy 找含「產業」或 "industry" 的欄位
-    for k in ("產業類別","SubIndustryCategory","產業別","IndustryCategory",
-             "Category","產業","SubIndustry"):
+    for k in ("產業類別","產業別","SubIndustryCategory","IndustryCategory",
+             "Category","產業","SubIndustry","SecuritiesIndustryCode"):
         v = x.get(k)
-        if v: return str(v).strip()
+        if v: return _normalize_industry(v)
     for k, v in x.items():
         kl = str(k).lower()
         if (("產業" in str(k)) or ("industry" in kl) or ("category" in kl)) and v:
-            return str(v).strip()
+            return _normalize_industry(v)
     return ""
 
 def _extract_sid_field(x: dict) -> str:
@@ -1409,32 +1428,17 @@ def fetch_industry_map():
             print(f"    抽樣 sid→ind: {samples_3}")
     except Exception as e:
         print(f"  ⚠ TWSE 產業資料失敗: {e}")
-    # 上櫃 — 改用 TPEx ISIN OTC（有產業中文名稱）作為主來源
+    # 上櫃
     try:
-        url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-        # 這個 endpoint 沒有產業，跳過。改用代碼對照表
-        otc_industry_codes = {
-            "01":"水泥工業","02":"食品工業","03":"塑膠工業","04":"紡織纖維",
-            "05":"電機機械","06":"電器電纜","08":"玻璃陶瓷","09":"造紙工業",
-            "10":"鋼鐵工業","11":"橡膠工業","12":"汽車工業","14":"建材營造",
-            "15":"航運業","16":"觀光餐旅","17":"金融保險","18":"貿易百貨",
-            "20":"其他","21":"化學工業","22":"生技醫療","23":"油電燃氣",
-            "24":"半導體業","25":"電腦及週邊設備","26":"光電業","27":"通信網路",
-            "28":"電子零組件","29":"電子通路","30":"資訊服務","31":"其他電子",
-            "32":"文化創意","33":"農業科技","34":"電子商務",
-        }
-        url2 = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
-        r = requests.get(url2, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        url = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+        r = requests.get(url, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
         arr = r.json() if r.status_code == 200 else []
         n_before = len(out)
         for x in arr:
             sid = _extract_sid_field(x)
-            code = str(x.get("SecuritiesIndustryCode","")).strip().zfill(2)
-            ind = otc_industry_codes.get(code, "")
+            ind = _extract_industry_field(x)
             if sid and ind: out[sid] = ind
-        print(f"  · TPEx 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔（用代碼對照）")
-        if arr:
-            print(f"    所有 keys: {list(arr[0].keys())}")
+        print(f"  · TPEx 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔")
     except Exception as e:
         print(f"  ⚠ TPEx 產業資料失敗: {e}")
     if len(out) > 100:
