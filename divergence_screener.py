@@ -22,7 +22,7 @@ import pandas as pd
 import numpy as np
 import requests as req
 import json, time, threading, os, warnings, logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -278,6 +278,145 @@ def batch_preload():
     save_hist_cache_disk()
     preload_done = True
     print(f"  🎉 就緒！{len(watchlist)} 支股票可掃描")
+
+
+# ── 增量更新：自動偵測快取是否需要補抓最近交易日 ──────────
+def latest_trading_day_tw() -> "pd.Timestamp":
+    """
+    回傳台股最新交易日（以本機時間判斷，假設使用者在台灣時區）。
+    - 週末 → 上週五
+    - 平日盤中（13:30 前）→ 昨日
+    - 平日盤後（13:30 後）→ 今日
+    """
+    now = datetime.now()
+    d = now.date()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    if d == now.date():
+        cur_min = now.hour * 60 + now.minute
+        if cur_min < 13 * 60 + 30:
+            d -= timedelta(days=1)
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+    return pd.Timestamp(d)
+
+
+def _incremental_download(stocks: list, period: str = "10d") -> int:
+    """批次下載最近 N 天並合併進現有 3mo / 1y 快取"""
+    if not stocks:
+        return 0
+    t0 = time.time()
+    merged = [0]
+    lock = threading.Lock()
+
+    def dl_batch(batch, suffix, ex_name):
+        if not batch:
+            return
+        tickers = " ".join(f"{s['id']}{suffix}" for s in batch)
+        try:
+            raw = yf.download(tickers, period=period, group_by="ticker",
+                              progress=False, auto_adjust=True, threads=True)
+        except Exception:
+            return
+        single = len(batch) == 1
+        try:
+            cols0 = None if single else raw.columns.get_level_values(0)
+        except Exception:
+            return
+        for s in batch:
+            tid = f"{s['id']}{suffix}"
+            try:
+                if single:
+                    new_df = raw
+                elif tid in cols0:
+                    new_df = raw[tid]
+                else:
+                    continue
+                if isinstance(new_df.columns, pd.MultiIndex):
+                    new_df.columns = new_df.columns.get_level_values(0)
+                new_df = new_df.dropna()
+                if len(new_df) == 0:
+                    continue
+                sid = s["id"]
+                cutoff = new_df.index[0]
+                # 合併到同股票的所有期間快取
+                for hist_period in ("3mo", "1y"):
+                    key = f"{sid}_{hist_period}_1d_{ex_name}"
+                    with hist_lock:
+                        old_entry = hist_cache.get(key)
+                    if old_entry is None:
+                        continue
+                    old_df = old_entry["df"]
+                    head = old_df[old_df.index < cutoff]
+                    combined = pd.concat([head, new_df])
+                    # 修剪：3mo 保留 ~90 row, 1y 保留 ~280 row
+                    max_rows = 280 if hist_period == "1y" else 90
+                    if len(combined) > max_rows:
+                        combined = combined.tail(max_rows)
+                    with hist_lock:
+                        hist_cache[key] = {"df": combined, "ts": time.time()}
+                    with lock:
+                        merged[0] += 1
+            except Exception:
+                pass
+
+    tse = [s for s in stocks if s.get("ex", "tse") == "tse"]
+    otc = [s for s in stocks if s.get("ex", "tse") == "otc"]
+    BSIZ = 50
+    tasks = []
+    for i in range(0, len(tse), BSIZ):
+        tasks.append(_dl_executor.submit(dl_batch, tse[i:i+BSIZ], ".TW",  "tse"))
+    for i in range(0, len(otc), BSIZ):
+        tasks.append(_dl_executor.submit(dl_batch, otc[i:i+BSIZ], ".TWO", "otc"))
+    done = 0
+    for f in as_completed(tasks):
+        done += 1
+        print(f"  增量批次 {done}/{len(tasks)} 完成（已合併 {merged[0]} 筆）...", end="\r")
+
+    elapsed = round(time.time() - t0, 1)
+    print(f"\n  ✅ 增量更新完成：合併 {merged[0]} 筆快取，{elapsed} 秒")
+    return merged[0]
+
+
+def incremental_refresh():
+    """
+    啟動時呼叫：檢查快取最後一根 K 棒是否為最新交易日。
+    若否，批次下載最近 10 天並合併進快取。比手動 del hist_cache.pkl
+    再重抓 ~30 秒快，因為只抓 10 天而不是 1 年。
+    """
+    if not hist_cache:
+        return
+
+    # 找快取裡的最新日期（掃前幾筆即可，假設大部分股票同步）
+    latest = None
+    checked = 0
+    for k, entry in hist_cache.items():
+        df = entry["df"]
+        if df is None or len(df) == 0:
+            continue
+        last = df.index[-1]
+        if latest is None or last > latest:
+            latest = last
+        checked += 1
+        if checked >= 20:
+            break
+
+    if latest is None:
+        return
+
+    expected = latest_trading_day_tw()
+    latest_date = latest.date() if hasattr(latest, "date") else latest
+    expected_date = expected.date()
+
+    if latest_date >= expected_date:
+        print(f"  ✅ 快取已是最新交易日（{latest_date}）")
+        return
+
+    print(f"  📅 快取最後 K 棒: {latest_date} → 最新交易日: {expected_date}")
+    print(f"  🔄 批次補抓最近 10 天...")
+    n = _incremental_download(list(watchlist), period="10d")
+    if n > 0:
+        save_hist_cache_disk()
 
 
 def load_delisted():
@@ -1449,10 +1588,11 @@ def index():
 # ── 啟動序列 ──────────────────────────────────────────────
 def startup():
     print("  🚀 背離選股系統（極速版）啟動...")
-    fast_warmup()        # ★ numba 預編譯
+    fast_warmup()          # ★ numba 預編譯
     load_delisted()
     load_stock_list()
     batch_preload()
+    incremental_refresh()  # ★ 自動偵測快取，必要時補最近 10 天
 
 
 threading.Thread(target=startup, daemon=True).start()
