@@ -1807,7 +1807,7 @@ def api_scan_buysignal():
             ma_max = max(ma_vals); ma_min = min(ma_vals)
             if ma_min > 0:
                 cluster_pct = (ma_max - ma_min) / ma_min * 100
-                ma_loose = (cluster_pct >= 2.5) or (change_pct >= 3.0)
+                ma_loose = (cluster_pct >= 2.5) or (change_pct >= 5.0)
 
         if mode == "A":
             triggered = (has_ut and ut_above_trail and
@@ -2306,8 +2306,8 @@ def api_why(sid):
     ma_loose = True; ma_cluster_pct = None
     if len(ma_vals) >= 3 and min(ma_vals)>0:
         ma_cluster_pct = (max(ma_vals)-min(ma_vals))/min(ma_vals)*100
-        ma_loose = (ma_cluster_pct >= 2.5) or (change_pct >= 3.0)
-    ma_gate_name = f"MA偏差≥2.5%或漲幅≥3%（實際偏差{ma_cluster_pct:.2f}%）" if ma_cluster_pct else "MA偏差≥2.5%或漲幅≥3%"
+        ma_loose = (ma_cluster_pct >= 2.5) or (change_pct >= 5.0)
+    ma_gate_name = f"MA偏差≥2.5%或漲幅≥5%（實際偏差{ma_cluster_pct:.2f}%）" if ma_cluster_pct else "MA偏差≥2.5%或漲幅≥5%"
     common = {
         "成交量≥20張":  vol >= 20,
         "排除產業":      not industry_excluded,
