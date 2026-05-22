@@ -1402,24 +1402,39 @@ def fetch_industry_map():
             sid = _extract_sid_field(x)
             ind = _extract_industry_field(x)
             if sid and ind: out[sid] = ind
-        sample = arr[0] if arr else {}
         print(f"  · TWSE 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔")
-        if arr: print(f"    範例: {dict(list(sample.items())[:5])}")
+        if arr:
+            print(f"    所有 keys: {list(arr[0].keys())}")
+            samples_3 = [(s, out.get(s,"(無)")) for s in ("1101","1525","2603","2330")]
+            print(f"    抽樣 sid→ind: {samples_3}")
     except Exception as e:
         print(f"  ⚠ TWSE 產業資料失敗: {e}")
-    # 上櫃
+    # 上櫃 — 改用 TPEx ISIN OTC（有產業中文名稱）作為主來源
     try:
-        url = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
-        r = requests.get(url, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+        # 這個 endpoint 沒有產業，跳過。改用代碼對照表
+        otc_industry_codes = {
+            "01":"水泥工業","02":"食品工業","03":"塑膠工業","04":"紡織纖維",
+            "05":"電機機械","06":"電器電纜","08":"玻璃陶瓷","09":"造紙工業",
+            "10":"鋼鐵工業","11":"橡膠工業","12":"汽車工業","14":"建材營造",
+            "15":"航運業","16":"觀光餐旅","17":"金融保險","18":"貿易百貨",
+            "20":"其他","21":"化學工業","22":"生技醫療","23":"油電燃氣",
+            "24":"半導體業","25":"電腦及週邊設備","26":"光電業","27":"通信網路",
+            "28":"電子零組件","29":"電子通路","30":"資訊服務","31":"其他電子",
+            "32":"文化創意","33":"農業科技","34":"電子商務",
+        }
+        url2 = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+        r = requests.get(url2, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
         arr = r.json() if r.status_code == 200 else []
         n_before = len(out)
         for x in arr:
             sid = _extract_sid_field(x)
-            ind = _extract_industry_field(x)
+            code = str(x.get("SecuritiesIndustryCode","")).strip().zfill(2)
+            ind = otc_industry_codes.get(code, "")
             if sid and ind: out[sid] = ind
-        sample = arr[0] if arr else {}
-        print(f"  · TPEx 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔")
-        if arr: print(f"    範例: {dict(list(sample.items())[:8])}")
+        print(f"  · TPEx 產業 API: status={r.status_code}, 筆數={len(arr)}, 解析出 {len(out)-n_before} 檔（用代碼對照）")
+        if arr:
+            print(f"    所有 keys: {list(arr[0].keys())}")
     except Exception as e:
         print(f"  ⚠ TPEx 產業資料失敗: {e}")
     if len(out) > 100:
@@ -1429,9 +1444,12 @@ def fetch_industry_map():
         except Exception as e:
             print(f"  ⚠ 寫 cache 失敗: {e}")
         with industry_lock: industry_map = out
-        # 列出排除產業在 map 裡的數量
+        # 列出排除產業在 map 裡的數量 + 統計前 15 大產業類別
         excl_count = sum(1 for v in out.values() if is_excluded_industry(v))
         print(f"  ✅ 產業 map：{len(out)} 檔（預設排除產業命中 {excl_count} 檔）")
+        from collections import Counter
+        top = Counter(out.values()).most_common(15)
+        print(f"  📊 產業分布 Top15: {top}")
     else:
         print(f"  ❌ 產業 map 抓取失敗，僅 {len(out)} 檔。產業過濾將失效（但 MA 緊纏過濾仍生效）")
 
