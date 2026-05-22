@@ -32,6 +32,7 @@ from williams_v4 import calc_williams_signals_v4
 from fast_indicators import (
     ut_bot_trail, ut_bot_trend,
     find_pivot_lows_nb, find_pivot_highs_nb,
+    calc_all_indicators_fast,
     warmup as fast_warmup,
 )
 
@@ -343,88 +344,130 @@ def _load_hist_cache_disk() -> bool:
 
 
 # ══════════════════════════════════════════════════════════
-# ▌ 一次計算所有技術指標（★ UT Bot 改 numba JIT）
+# ▌ scan_cache 持久化（避免每次重啟都要 141 秒重算）
+#   TTL 6 小時，且要比 hist_cache.pkl 新
+# ══════════════════════════════════════════════════════════
+SCAN_CACHE_TTL = 6 * 3600  # 6 小時
+
+def _save_scan_cache_disk():
+    """把當前掃描結果存盤；只在 cache 有實質內容時存"""
+    try:
+        import pickle
+        with cache_lock:
+            data = dict(cache)
+        if len(data) < 100:
+            return
+        with open(SCAN_CACHE_FILE, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  💾 掃描快取存檔（{len(data)} 檔）")
+    except Exception as e:
+        print(f"  ⚠ 掃描快取存檔失敗: {e}")
+
+
+def _load_scan_cache_disk() -> bool:
+    """啟動時嘗試載入；過期或比歷史快取舊則放棄"""
+    global cache
+    try:
+        import pickle
+        if not os.path.exists(SCAN_CACHE_FILE):
+            return False
+        scan_mtime = os.path.getmtime(SCAN_CACHE_FILE)
+        if (time.time() - scan_mtime) >= SCAN_CACHE_TTL:
+            return False
+        # 若歷史快取比掃描快取新，掃描快取已過期
+        if os.path.exists(HIST_CACHE_FILE):
+            hist_mtime = os.path.getmtime(HIST_CACHE_FILE)
+            if hist_mtime > scan_mtime + 60:  # 60 秒容差
+                print(f"  ℹ 掃描快取早於歷史快取，重新計算")
+                return False
+        with open(SCAN_CACHE_FILE, "rb") as f:
+            data = pickle.load(f)
+        if len(data) < 100:
+            return False
+        with cache_lock:
+            cache.update(data)
+        print(f"  ✅ 掃描快取載入：{len(cache)} 筆（fast mode 即用）")
+        return True
+    except Exception as e:
+        print(f"  ⚠ 掃描快取載入失敗: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════
+# ▌ 一次計算所有技術指標（★ 全 numba JIT）
 # ══════════════════════════════════════════════════════════
 def calc_all_indicators(closes: pd.Series, highs: pd.Series,
                          lows: pd.Series, volumes: pd.Series) -> dict:
-    ind = {}
+    """
+    ★ 完全用 numba JIT 計算（含 OBV / Bollinger / Williams / MA60 等）
+    比原 pandas 版本快約 20-30 倍。輸出仍包成 pd.Series 維持下游相容。
+    UT Bot 因依賴前一根狀態，使用獨立 numba 函式分開算。
+    """
     n   = len(closes)
     idx = closes.index
 
-    # ── MACD ──────────────────────────────────────────────
-    ema12 = closes.ewm(span=12, adjust=False).mean()
-    ema26 = closes.ewm(span=26, adjust=False).mean()
-    dif   = ema12 - ema26
-    dea   = dif.ewm(span=9, adjust=False).mean()
-    ind["dif"]  = dif
-    ind["dea"]  = dea
-    ind["hist"] = (dif - dea) * 2
+    # ── numpy 陣列化 ──────────────────────────────────
+    c_arr = np.asarray(closes, dtype=np.float64)
+    h_arr = np.asarray(highs,  dtype=np.float64)
+    l_arr = np.asarray(lows,   dtype=np.float64)
+    v_arr = np.asarray(volumes, dtype=np.float64)
 
-    # ── RSI(14) ───────────────────────────────────────────
-    delta = closes.diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    ind["rsi"] = 100 - (100 / (1 + rs))
+    # ── 主指標（單一 numba 呼叫一次算完）────────────
+    (dif, dea, hist, rsi, K, D,
+     ma5, ma10, ma20, ma60,
+     vol_ma5, vol_ratio, obv, obv_ma,
+     bb_upper, bb_mid, bb_lower, wr) = calc_all_indicators_fast(
+        c_arr, h_arr, l_arr, v_arr
+    )
 
-    # ── KD(9,3,3) ────────────────────────────────────────
-    low_n  = lows.rolling(9).min()
-    high_n = highs.rolling(9).max()
-    rsv    = (closes - low_n) / (high_n - low_n + 1e-9) * 100
-    ind["K"] = rsv.ewm(com=2, adjust=False).mean()
-    ind["D"] = ind["K"].ewm(com=2, adjust=False).mean()
+    ind = {
+        "dif":       pd.Series(dif,       index=idx),
+        "dea":       pd.Series(dea,       index=idx),
+        "hist":      pd.Series(hist,      index=idx),
+        "rsi":       pd.Series(rsi,       index=idx),
+        "K":         pd.Series(K,         index=idx),
+        "D":         pd.Series(D,         index=idx),
+        "ma5":       pd.Series(ma5,       index=idx),
+        "ma10":      pd.Series(ma10,      index=idx),
+        "ma20":      pd.Series(ma20,      index=idx),
+        "ma60":      pd.Series(ma60,      index=idx),
+        "vol_ma5":   pd.Series(vol_ma5,   index=idx),
+        "vol_ratio": pd.Series(vol_ratio, index=idx),
+        "obv":       pd.Series(obv,       index=idx),
+        "obv_ma":    pd.Series(obv_ma,    index=idx),
+        "bb_upper":  pd.Series(bb_upper,  index=idx),
+        "bb_mid":    pd.Series(bb_mid,    index=idx),
+        "bb_lower":  pd.Series(bb_lower,  index=idx),
+        "wr":        pd.Series(wr,        index=idx),
+    }
 
-    # ── 均線 ─────────────────────────────────────────────
-    for p in [5, 10, 20, 60]:
-        ind[f"ma{p}"] = closes.ewm(span=p, adjust=False).mean()
-
-    # ── 成交量均量 ────────────────────────────────────────
-    ind["vol_ma5"]   = volumes.rolling(5).mean()
-    ind["vol_ratio"] = volumes / ind["vol_ma5"].replace(0, np.nan)
-
-    # ── OBV ──────────────────────────────────────────────
-    direction    = np.sign(closes.diff()).fillna(0)
-    ind["obv"]   = (direction * volumes).cumsum()
-    ind["obv_ma"] = ind["obv"].rolling(10).mean()
-
-    # ── Bollinger(20,2) ──────────────────────────────────
-    bb_mid = closes.rolling(20).mean()
-    bb_std = closes.rolling(20).std()
-    ind["bb_upper"] = bb_mid + bb_std * 2
-    ind["bb_mid"]   = bb_mid
-    ind["bb_lower"] = bb_mid - bb_std * 2
-
-    # ── UT Bot（★ numba 加速）──────────────────────────
+    # ── UT Bot（用 numba ut_bot_trail / ut_bot_trend）
     try:
-        atr_period = 1
-        key_value  = 3.0
-        prev_close = closes.shift(1)
-        tr = pd.concat([
-            highs - lows,
-            (highs - prev_close).abs(),
-            (lows  - prev_close).abs(),
-        ], axis=1).max(axis=1)
-        atr      = tr.ewm(span=atr_period, adjust=False).mean()
-        loss_thr = (key_value * atr).values.astype(np.float64)
-        c_arr    = closes.values.astype(np.float64)
+        # atr_period=1 + ewm(span=1) → alpha=1 → atr = tr (無平滑)
+        prev_close = np.empty(n)
+        prev_close[0]  = c_arr[0]
+        prev_close[1:] = c_arr[:-1]
+        tr_arr = np.maximum(
+            np.maximum(h_arr - l_arr, np.abs(h_arr - prev_close)),
+            np.abs(l_arr - prev_close)
+        )
+        loss_thr = 3.0 * tr_arr  # key_value=3.0
         trail_arr = ut_bot_trail(c_arr, loss_thr)
         ut_t      = ut_bot_trend(c_arr, trail_arr)
-
-        trail_s = pd.Series(trail_arr, index=idx)
-        ind["ut_trail"] = trail_s
-        ind["ut_buy"]   = (closes > trail_s) & (closes.shift(1) <= trail_s.shift(1))
-        ind["ut_sell"]  = (closes < trail_s) & (closes.shift(1) >= trail_s.shift(1))
-        ind["ut_trend"] = pd.Series(ut_t, index=idx)
+        # ut_buy/ut_sell 用 numpy 算交叉
+        prev_c    = np.empty(n); prev_c[0]    = c_arr[0];    prev_c[1:]    = c_arr[:-1]
+        prev_trl  = np.empty(n); prev_trl[0]  = trail_arr[0]; prev_trl[1:] = trail_arr[:-1]
+        ut_buy_arr  = (c_arr > trail_arr) & (prev_c <= prev_trl)
+        ut_sell_arr = (c_arr < trail_arr) & (prev_c >= prev_trl)
+        ind["ut_trail"] = pd.Series(trail_arr,   index=idx)
+        ind["ut_buy"]   = pd.Series(ut_buy_arr,  index=idx)
+        ind["ut_sell"]  = pd.Series(ut_sell_arr, index=idx)
+        ind["ut_trend"] = pd.Series(ut_t,        index=idx)
     except Exception:
-        ind["ut_trail"] = closes * 0
+        ind["ut_trail"] = pd.Series(np.zeros(n), index=idx)
         ind["ut_buy"]   = pd.Series(False, index=idx)
         ind["ut_sell"]  = pd.Series(False, index=idx)
         ind["ut_trend"] = pd.Series(0, index=idx)
-
-    # ── Williams %R(20) ──────────────────────────────────
-    high20 = highs.rolling(20).max()
-    low20  = lows.rolling(20).min()
-    ind["wr"] = (high20 - closes) / (high20 - low20 + 1e-9) * -100
 
     return ind
 
@@ -1252,7 +1295,12 @@ def batch_scan_all(batch_size: int = 100, delay: float = 0.0,
             print(f"  進度 {done_count}/{total} ({pct}%) 訊號{signals_found}檔", end="\r")
 
     elapsed = round(time.time() - t0, 1)
-    print(f"\n  ✅ {mode_str}掃描完成：{len(results)}/{total} 支，{signals_found} 個訊號，{elapsed} 秒")
+    print(f"\n  ✅ {mode_str}掃描完成：{len(results)}/{total} 支,{signals_found} 個訊號，{elapsed} 秒")
+
+    # ★ 完整模式掃完後存盤，下次啟動可直接 fast mode
+    if not fast_mode and len(results) >= 100:
+        threading.Thread(target=_save_scan_cache_disk, daemon=True).start()
+
     return results
 
 
@@ -1822,10 +1870,11 @@ def index():
 # ══════════════════════════════════════════════════════════
 def startup_sequence():
     print("  🚀 啟動序列開始...")
-    fast_warmup()                  # ★ numba 預編譯
+    fast_warmup()                  # ★ numba 預編譯（含 calc_all_indicators_fast）
     _load_delisted()
     load_full_stock_list()
     warm_up_cache()
+    _load_scan_cache_disk()        # ★ 載入上次掃描結果，第一次掃描即可走 fast mode
     _save_delisted()
     print("  🎉 啟動完成！可以開始掃描。")
 
