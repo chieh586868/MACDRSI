@@ -30,7 +30,11 @@ logging.getLogger("peewee").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 import yfinance as yf
 
-from fast_indicators import find_pivot_lows_nb, warmup as fast_warmup
+from fast_indicators import (
+    find_pivot_lows_nb,
+    calc_indicators_fast,
+    warmup as fast_warmup,
+)
 
 app = Flask(__name__)
 CORS(app)
@@ -336,30 +340,35 @@ def load_stock_list():
         print(f"  ✅ {len(unique)} 支（上市{len(tse)}+上櫃{len(otc)}）")
 
 
-# ── 指標計算（保持 pandas，向量化已足夠快）─────────────────
+# ── 指標計算（★ 改用 numba 全部 inline 計算，去除 pandas 開銷）
 def calc_ind(closes, highs, lows, volumes):
-    ind = {}
-    e12 = closes.ewm(span=12, adjust=False).mean()
-    e26 = closes.ewm(span=26, adjust=False).mean()
-    dif = e12 - e26
-    dea = dif.ewm(span=9, adjust=False).mean()
-    ind["dif"]  = dif
-    ind["dea"]  = dea
-    ind["hist"] = (dif - dea) * 2
-    d = closes.diff()
-    g = d.clip(lower=0).rolling(14).mean()
-    l = (-d.clip(upper=0)).rolling(14).mean()
-    ind["rsi"] = 100 - (100 / (1 + g / l.replace(0, np.nan)))
-    low9  = lows.rolling(9).min()
-    high9 = highs.rolling(9).max()
-    rsv   = (closes - low9) / (high9 - low9 + 1e-9) * 100
-    ind["K"] = rsv.ewm(com=2, adjust=False).mean()
-    ind["D"] = ind["K"].ewm(com=2, adjust=False).mean()
-    for p in [5, 10, 20]:
-        ind[f"ma{p}"] = closes.ewm(span=p, adjust=False).mean()
-    vm = volumes.rolling(5).mean()
-    ind["vol_ratio"] = volumes / vm.replace(0, np.nan)
-    return ind
+    """
+    用 fast_indicators.calc_indicators_fast 一次算完所有指標。
+    輸出仍包成 pd.Series 維持與舊版相容（避免動到 detect_div 等下游）。
+    profile 顯示原版 pandas 版本 1y 資料約 50ms/股，
+    改 numba 後預期 1-2ms/股（25-50x 加速）。
+    """
+    c_arr = np.asarray(closes, dtype=np.float64)
+    h_arr = np.asarray(highs,  dtype=np.float64)
+    l_arr = np.asarray(lows,   dtype=np.float64)
+    v_arr = np.asarray(volumes, dtype=np.float64)
+
+    dif, dea, hist, rsi, K, D, ma5, ma10, ma20, vol_ratio = \
+        calc_indicators_fast(c_arr, h_arr, l_arr, v_arr)
+
+    idx = closes.index if hasattr(closes, "index") else None
+    return {
+        "dif":       pd.Series(dif,       index=idx),
+        "dea":       pd.Series(dea,       index=idx),
+        "hist":      pd.Series(hist,      index=idx),
+        "rsi":       pd.Series(rsi,       index=idx),
+        "K":         pd.Series(K,         index=idx),
+        "D":         pd.Series(D,         index=idx),
+        "ma5":       pd.Series(ma5,       index=idx),
+        "ma10":      pd.Series(ma10,      index=idx),
+        "ma20":      pd.Series(ma20,      index=idx),
+        "vol_ratio": pd.Series(vol_ratio, index=idx),
+    }
 
 
 # ── 背離偵測（★ pivot 使用 numba；★ 跳過無必要的 NaN 填補）──
