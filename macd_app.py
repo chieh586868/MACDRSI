@@ -1759,6 +1759,83 @@ def api_scan_divergence():
         "div_type":div_type,"min_score":min_score,
         "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
+@app.route("/api/scan/condition_d", methods=["GET"])
+def api_scan_condition_d():
+    """條件 D：日K背離分數≥5 + 週K背離分數≥2（三指標+日週雙重 / 日週強烈共振）"""
+    with cache_lock: cached = list(cache.values())
+    if not cached:
+        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"D"}), 400
+
+    candidates = [r for r in cached
+                  if (r.get("div") or {}).get("score", 0) >= 3
+                  and r.get("volume", 0) >= 20]
+    if not candidates:
+        return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"D",
+                                  "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+    def analyze_dw(r):
+        sid = r.get("id")
+        ex = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
+        try:
+            df = fetch_history(sid, period="1y", ex=ex)
+            if len(df) < 60: return None
+            closes  = df["Close"]; volumes = df["Volume"]
+            highs   = df["High"] if "High" in df.columns else closes
+            lows_s  = df["Low"]  if "Low"  in df.columns else closes
+            ind_d   = calc_all_indicators(closes, highs, lows_s, volumes)
+            div_d   = calc_divergence_signals(ind_d, closes, highs, lows_s, volumes,
+                                                lookback=120, max_bars=15)
+            if div_d.get("score", 0) < 5: return None
+
+            df.index = pd.to_datetime(df.index)
+            wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
+                                              "Close":"last","Volume":"sum"}).dropna()
+            if len(wdf) < 12: return None
+            wc = wdf["Close"]; wv = wdf["Volume"]
+            wh = wdf["High"] if "High" in wdf.columns else wc
+            wl = wdf["Low"]  if "Low"  in wdf.columns else wc
+            ind_w = calc_all_indicators(wc, wh, wl, wv)
+            div_w = calc_divergence_signals(ind_w, wc, wh, wl, wv,
+                                              lookback=60, max_bars=10)
+            ws = div_w.get("score", 0)
+            if ws < 2: return None
+            return r, div_d, div_w
+        except Exception:
+            return None
+
+    hits = []
+    futures = {_global_executor.submit(analyze_dw, r): r for r in candidates}
+    for future in as_completed(futures):
+        try:
+            res = future.result(timeout=30)
+            if not res: continue
+            r, div_d, div_w = res
+            ws = div_w.get("score", 0)
+            ds = div_d.get("score", 0)
+            r_out = {**r, "div": div_d}
+            r_out["weekly_score"]    = ws
+            r_out["weekly_signals"]  = div_w.get("buy_signals", [])
+            r_out["weekly_summary"]  = div_w.get("summary", "")
+            r_out["strong_resonance"]= ws >= 4
+            r_out["double_resonance"]= True
+            r_out["buy_mode"]        = "D"
+            tag = "日週強烈共振" if ws >= 4 else "日週雙重共振"
+            r_out["buy_reasons"]     = [f"日背離({ds}分)", f"週背離({ws}分)", tag]
+            hits.append(r_out)
+        except Exception:
+            pass
+
+    hits.sort(key=lambda x: (
+        -int(x.get("strong_resonance", False)),
+        -x.get("weekly_score", 0),
+        -(x.get("div") or {}).get("score", 0),
+        -x.get("change_pct", 0),
+    ))
+    return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
+                              "mode":"D","candidates":len(candidates),
+                              "strong_count":sum(1 for h in hits if h.get("strong_resonance")),
+                              "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
 @app.route("/api/status", methods=["GET"])
 def api_status():
     now = datetime.now()

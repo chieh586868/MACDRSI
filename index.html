@@ -311,15 +311,19 @@ function scan(mode) {
   fetch('/api/scan')
     .then(r => r.json())
     .then(() => {
-      // 再用條件 mode 過濾
-      return fetch(`/api/scan/buysignal?mode=${mode}`);
+      // 條件 D 走專屬端點（日週雙重背離），其餘走 buysignal 過濾
+      const url = (mode === 'D') ? '/api/scan/condition_d'
+                                 : `/api/scan/buysignal?mode=${mode}`;
+      return fetch(url);
     })
     .then(r => r.json())
     .then(data => {
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       const rows = data.data || [];
+      const extra = (mode === 'D' && data.strong_count !== undefined)
+        ? `（強烈共振 ${data.strong_count} 支）` : '';
       setInfo(
-        `✓ 條件 ${mode}：找到 ${rows.length} 支 / 共掃描 ${data.total} 支，耗時 ${elapsed} 秒`,
+        `✓ 條件 ${mode}：找到 ${rows.length} 支${extra} / 共掃描 ${data.total} 支，耗時 ${elapsed} 秒`,
         rows.length > 0 ? 'ok' : ''
       );
       render(rows);
@@ -337,15 +341,19 @@ function setBtns(disabled) {
 // 只用已掃描結果再過濾，不重新跑 /api/scan
 function filter(mode) {
   setBtns(true);
-  setInfo(`過濾條件 ${mode} 中...`, '');
+  setInfo(`過濾條件 ${mode} 中...${mode==='D'?'（D 需重抓1年資料，~10-30秒）':''}`, '');
   const t0 = Date.now();
-  fetch(`/api/scan/buysignal?mode=${mode}`)
+  const url = (mode === 'D') ? '/api/scan/condition_d'
+                             : `/api/scan/buysignal?mode=${mode}`;
+  fetch(url)
     .then(r => r.json())
     .then(data => {
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       const rows = data.data || [];
+      const extra = (mode === 'D' && data.strong_count !== undefined)
+        ? `（強烈共振 ${data.strong_count} 支）` : '';
       setInfo(
-        `✓ 過濾 ${mode}：找到 ${rows.length} 支 / 共 ${data.total} 支，耗時 ${elapsed} 秒`,
+        `✓ 過濾 ${mode}：找到 ${rows.length} 支${extra} / 共 ${data.total} 支，耗時 ${elapsed} 秒`,
         rows.length > 0 ? 'ok' : ''
       );
       render(rows);
