@@ -98,7 +98,8 @@ td {
 td.r { text-align: right; font-family: monospace; }
 tr:hover { background: #161b22; }
 
-.sid { font-weight: 700; font-family: monospace; font-size: 15px; }
+.sid { font-weight: 700; font-family: monospace; font-size: 18px; }
+.sname { font-size: 18px; font-weight: 600; }
 .up { color: #ef4444; font-weight: 600; }
 .dn { color: #22c55e; font-weight: 600; }
 .flat { color: #7d8590; }
@@ -334,7 +335,7 @@ function render(rows) {
     return `<tr>
       <td>${i+1}</td>
       <td class="sid">${r.id}</td>
-      <td>${r.name || ''}</td>
+      <td class="sname">${r.name || ''}</td>
       <td class="r price">${(r.close||0).toFixed(2)}</td>
       <td class="r ${cls}">${arrow} ${Math.abs(chg).toFixed(2)}</td>
       <td class="r ${cls}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
