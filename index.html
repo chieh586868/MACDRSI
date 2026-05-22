@@ -180,6 +180,11 @@ tr:hover { background: #161b22; }
   <button class="btn btn-mini btn-filter" onclick="filter('B')">B</button>
   <button class="btn btn-mini btn-filter" onclick="filter('C')">C</button>
   <button class="btn btn-mini btn-filter" onclick="filter('D')">D</button>
+  <label style="margin-left:14px;color:#cbd5e1;font-size:13px;cursor:pointer">
+    <input type="checkbox" id="excl-trad" checked style="vertical-align:middle">
+    排除冷門產業
+    <span style="color:#64748b;font-size:11px">(水泥/塑膠/紡織/營建/航運/造紙/觀光/橡膠)</span>
+  </label>
   <button class="btn btn-mini" style="background:#10b981;margin-left:auto" onclick="exportCSV()">📥 匯出 CSV</button>
 </div>
 
@@ -309,13 +314,15 @@ function scan(mode) {
   setInfo(`正在執行條件 ${mode} 掃描，第一次會慢 (~50秒)，之後快...`, '');
 
   const t0 = Date.now();
+  const exclTrad = document.getElementById('excl-trad').checked ? '1' : '0';
   // 先跑完整掃描（更新 cache + 即時報價）
   fetch('/api/scan')
     .then(r => r.json())
     .then(() => {
       // D 走背離端點，其餘走 buysignal
-      const url = (mode === 'D') ? '/api/scan/condition_d'
-                                 : `/api/scan/buysignal?mode=${mode}`;
+      const url = (mode === 'D')
+        ? `/api/scan/condition_d?exclude_traditional=${exclTrad}`
+        : `/api/scan/buysignal?mode=${mode}&exclude_traditional=${exclTrad}`;
       return fetch(url);
     })
     .then(r => r.json())
@@ -346,8 +353,10 @@ function filter(mode) {
   setBtns(true);
   setInfo(`過濾條件 ${mode} 中...${mode==='D'?'（D 需重抓1年資料，~10-30秒）':''}`, '');
   const t0 = Date.now();
-  const url = (mode === 'D') ? '/api/scan/condition_d'
-                             : `/api/scan/buysignal?mode=${mode}`;
+  const exclTrad = document.getElementById('excl-trad').checked ? '1' : '0';
+  const url = (mode === 'D')
+    ? `/api/scan/condition_d?exclude_traditional=${exclTrad}`
+    : `/api/scan/buysignal?mode=${mode}&exclude_traditional=${exclTrad}`;
   fetch(url)
     .then(r => r.json())
     .then(data => {

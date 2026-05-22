@@ -80,6 +80,7 @@ HIST_CACHE_FILE = "hist_cache.pkl"
 SCAN_CACHE_FILE = "scan_cache.pkl"
 FULL_LIST_FILE  = "tw_stocks.json"
 WATCHLIST2_FILE = "watchlist2.json"
+INDUSTRY_FILE   = "industry_map.json"
 
 YF_BATCH_SIZE   = 50
 SCAN_WORKERS    = 40
@@ -1332,6 +1333,58 @@ def fetch_otc_stock_list():
     except Exception as e:
         print(f"  ⚠ TPEx清單失敗: {e}"); return []
 
+# ── 產業類別 map (sid -> 產業) ─────────────────────────────
+industry_map = {}
+industry_lock = threading.Lock()
+
+# 預設排除產業（傳統 / 景氣循環股）
+DEFAULT_EXCLUDED_INDUSTRIES = {
+    "水泥工業","塑膠工業","紡織纖維","建材營造","航運業",
+    "造紙工業","觀光餐旅","觀光事業","橡膠工業"
+}
+
+def fetch_industry_map():
+    """從 TWSE / TPEx 拿產業類別，建 dict[sid -> 產業名稱]。7 天 cache。"""
+    global industry_map
+    if os.path.exists(INDUSTRY_FILE):
+        try:
+            if (time.time() - os.path.getmtime(INDUSTRY_FILE)) < 7*86400:
+                with open(INDUSTRY_FILE,"r",encoding="utf-8") as f:
+                    data = json.load(f)
+                if len(data) > 100:
+                    with industry_lock: industry_map = data
+                    print(f"  ✅ 產業 map cache：{len(data)} 檔"); return
+        except: pass
+    out = {}
+    # 上市
+    try:
+        r = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+                         timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        for x in r.json():
+            sid = str(x.get("公司代號",""))
+            ind = str(x.get("產業類別","")).strip()
+            if sid and ind: out[sid] = ind
+    except Exception as e:
+        print(f"  ⚠ TWSE 產業資料失敗: {e}")
+    # 上櫃
+    try:
+        r = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+                         timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        for x in r.json():
+            sid = str(x.get("SecuritiesCompanyCode") or x.get("公司代號") or "")
+            ind = str(x.get("SubIndustryCategory") or x.get("產業別") or "").strip()
+            if sid and ind: out[sid] = ind
+    except Exception as e:
+        print(f"  ⚠ TPEx 產業資料失敗: {e}")
+    if len(out) > 100:
+        try:
+            with open(INDUSTRY_FILE,"w",encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+        except: pass
+        with industry_lock: industry_map = out
+        print(f"  ✅ 產業 map：{len(out)} 檔")
+
+
 def load_full_stock_list():
     global full_stock_list, full_list_loaded, watchlist
     if os.path.exists(FULL_LIST_FILE):
@@ -1627,10 +1680,14 @@ def api_scan_utbot():
 @app.route("/api/scan/buysignal", methods=["GET"])
 def api_scan_buysignal():
     mode = request.args.get("mode","A")
+    exclude_traditional = request.args.get("exclude_traditional","1") != "0"
     with cache_lock: cached = list(cache.values())
     results = []
     for r in cached:
         if r.get("volume",0) < 20: continue
+        if exclude_traditional:
+            ind = industry_map.get(r.get("id",""), "")
+            if ind in DEFAULT_EXCLUDED_INDUSTRIES: continue
 
         has_fib = bool(r.get("fib",{}).get("buy_signals"))
         has_ut  = bool(r.get("ut_buy"))
@@ -1820,13 +1877,19 @@ def api_scan_condition_d():
     except Exception as e:
         return jsonify({"error":f"divergence_screener 匯入失敗：{e}","data":[],"hit_count":0,"mode":"D"}), 500
 
+    exclude_traditional = request.args.get("exclude_traditional","1") != "0"
     with cache_lock: cached = list(cache.values())
     if not cached:
         return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"D"}), 400
 
+    def _ind_ok(sid):
+        if not exclude_traditional: return True
+        return industry_map.get(sid, "") not in DEFAULT_EXCLUDED_INDUSTRIES
+
     candidates = [r for r in cached
                   if (r.get("div") or {}).get("score", 0) >= 2
-                  and r.get("volume", 0) >= 20]
+                  and r.get("volume", 0) >= 20
+                  and _ind_ok(r.get("id",""))]
     if not candidates:
         return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"D",
                                   "scanned_at":datetime.now().strftime("%H:%M:%S")}))
@@ -2131,6 +2194,82 @@ def api_backtest():
     except Exception as e:
         return jsonify({"error":str(e)}), 500
 
+@app.route("/api/why/<sid>", methods=["GET"])
+def api_why(sid):
+    """診斷某支股票為何沒進條件 A/B/C，回傳每個閘門的真假值"""
+    mode = request.args.get("mode","C").upper()
+    with cache_lock: r = cache.get(sid)
+    if not r:
+        return jsonify({"error":f"{sid} 不在 cache，請先跑掃描","sid":sid}), 404
+    ind = industry_map.get(sid, "(未知)")
+    industry_excluded = ind in DEFAULT_EXCLUDED_INDUSTRIES
+    has_fib = bool(r.get("fib",{}).get("buy_signals"))
+    has_ut  = bool(r.get("ut_buy"))
+    has_wr  = bool(r.get("wr",{}).get("buy_signals"))
+    div     = r.get("div",{})
+    has_div = bool(div.get("buy_signals")) or div.get("score",0) >= 2
+    close      = r.get("close",0)
+    ma5  = r.get("ma5",0);  ma10 = r.get("ma10",0)
+    ma20 = r.get("ma20",0); ma60 = r.get("ma60",0)
+    change_pct = r.get("change_pct",0)
+    vol        = r.get("volume",0)
+    vol_ratio  = r.get("vol_ratio",0)
+    ut_trail   = r.get("ut_trail",0)
+    confirm_score = (r.get("confirm") or {}).get("score",0)
+    fib_d = r.get("fib",{}).get("details",{})
+    fib_ma3 = fib_d.get("ma3", ma5); fib_ma5 = fib_d.get("ma5", ma5)
+    fib_above_ma = close>0 and ((fib_ma3>0 and close>=fib_ma3*0.995) or
+                                (fib_ma5>0 and close>=fib_ma5*0.995) or
+                                (ma5>0 and close>=ma5*0.995))
+    ut_above_trail = close>0 and (ut_trail<=0 or close>=ut_trail*0.995)
+    not_falling = change_pct >= -1.0
+    above_short_ma = close>0 and ((ma5>0 and close>=ma5*0.995) or
+                                   (ma10>0 and close>=ma10*0.995))
+    vol_ratio_ok = vol_ratio >= 1.2
+    rising_strong = change_pct >= 1.0
+    ma_vals = [v for v in (ma5,ma10,ma20,ma60) if v>0]
+    ma_loose = True; ma_cluster_pct = None
+    if len(ma_vals) >= 3 and min(ma_vals)>0:
+        ma_cluster_pct = (max(ma_vals)-min(ma_vals))/min(ma_vals)*100
+        ma_loose = ma_cluster_pct >= 2.5
+    gates = {
+        "成交量≥20張": vol >= 20,
+        "排除產業":     not industry_excluded,
+        "has_UT":      has_ut,
+        "has_費波南":   has_fib,
+        "has_威廉":     has_wr,
+        "has_背離":     has_div,
+        "UT在追蹤線上": ut_above_trail,
+        "費波南在MA上": fib_above_ma,
+        "未跌≥1%":      not_falling,
+        "現價在短MA上": above_short_ma,
+        "量比≥1.2":     vol_ratio_ok,
+        "漲幅≥1%":      rising_strong,
+        f"MA偏差≥2.5%（實際{ma_cluster_pct:.2f}%）" if ma_cluster_pct else "MA偏差≥2.5%": ma_loose,
+        f"確認分>4（實際{confirm_score}）": confirm_score > 4,
+    }
+    if mode == "A":
+        required = ["成交量≥20張","排除產業","has_UT","has_威廉","has_背離","UT在追蹤線上",
+                    "未跌≥1%","現價在短MA上","量比≥1.2","漲幅≥1%"]
+    elif mode == "B":
+        required = ["成交量≥20張","排除產業","has_UT","has_費波南","UT在追蹤線上","費波南在MA上",
+                    "未跌≥1%","現價在短MA上","量比≥1.2","漲幅≥1%"]
+    else:  # C
+        required = list(gates.keys())  # 所有都要
+    failed = [k for k in gates if k.startswith(tuple(req.split("（")[0] for req in required))
+              if not any(gates[g] for g in [k])]
+    fails = {k:v for k,v in gates.items() if not v}
+    return jsonify({"sid":sid, "name":r.get("name",""), "industry":ind,
+        "mode":mode, "passed_C": all(gates.values()),
+        "values":{
+            "close":close,"change_pct":round(change_pct,2),"volume":vol,
+            "vol_ratio":round(vol_ratio,2),"ma5":ma5,"ma10":ma10,"ma20":ma20,"ma60":ma60,
+            "ma_cluster_pct":round(ma_cluster_pct,2) if ma_cluster_pct else None,
+            "ut_trail":ut_trail,"confirm_score":confirm_score,
+        },
+        "gates": gates, "fails": fails})
+
+
 @app.route("/api/debug/<sid>", methods=["GET"])
 def api_debug(sid):
     ex = request.args.get("ex","tse")
@@ -2191,6 +2330,7 @@ def startup_sequence():
     fast_warmup()                  # ★ numba 預編譯（含 calc_all_indicators_fast）
     _load_delisted()
     load_full_stock_list()
+    fetch_industry_map()
     warm_up_cache()
     _load_scan_cache_disk()        # ★ 載入上次掃描結果，第一次掃描即可走 fast mode
     _save_delisted()
