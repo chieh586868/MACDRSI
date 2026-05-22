@@ -30,10 +30,10 @@ def calc_williams_r(highs: pd.Series, lows: pd.Series,
 # 嚴格波浪偵測：深底 → 波浪 → 脫離
 # ──────────────────────────────────────────────────────────
 def detect_wave_complete(sl: np.ndarray,
-                          deep_low_thr: float = -80.0,
+                          deep_low_thr: float = -85.0,
                           window_min: int = 8,
                           window_max: int = 21,
-                          min_peaks: int = 2,
+                          min_peaks: int = 3,
                           escape_thr: float = -50.0) -> dict:
     """
     回傳 dict：

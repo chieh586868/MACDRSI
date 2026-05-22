@@ -1632,21 +1632,27 @@ def api_scan_buysignal():
             (ma10 > 0 and close >= ma10 * 0.995)
         )
 
+        vol_ratio_ok = r.get("vol_ratio", 0) >= 1.2
+        rising_strong = change_pct >= 1.0
+
         if mode == "A":
             triggered = (has_ut and ut_above_trail and
                          has_wr and has_div and
-                         not_falling and above_short_ma)
+                         not_falling and above_short_ma and
+                         vol_ratio_ok and rising_strong)
         elif mode == "B":
             triggered = (has_ut and ut_above_trail and
                          has_fib and fib_above_ma and
-                         not_falling and above_short_ma)
+                         not_falling and above_short_ma and
+                         vol_ratio_ok and rising_strong)
         elif mode == "C":
             confirm_score = (r.get("confirm") or {}).get("score", 0)
             triggered = (has_ut and ut_above_trail and
                          has_fib and fib_above_ma and
                          has_wr and
                          not_falling and above_short_ma and
-                         confirm_score > 3)
+                         confirm_score > 4 and
+                         vol_ratio_ok and rising_strong)
         elif mode == "D":
             div_score    = div.get("score", 0)
             regular_cnt  = div.get("regular_count", 0)
