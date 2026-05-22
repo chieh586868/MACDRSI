@@ -1725,14 +1725,16 @@ def api_scan_buysignal():
         vol_ratio_ok = r.get("vol_ratio", 0) >= 1.2
         rising_strong = change_pct >= 1.0
 
-        # MA 緊纏排除：MA5/MA10/MA20/MA60 偏差 < 2.5% 視為橫盤無動能
+        # MA 緊纏 + 沒突破才排除：MA 偏差 < 2.5% 且 漲幅 < 3% = 真橫盤無動能
+        # （1525 江申類「緊纏後突破」+9.8% 要保留）
         ma60 = r.get("ma60", 0)
         ma_vals = [v for v in (ma5, ma10, ma20, ma60) if v > 0]
         ma_loose = True
         if len(ma_vals) >= 3:
             ma_max = max(ma_vals); ma_min = min(ma_vals)
             if ma_min > 0:
-                ma_loose = (ma_max - ma_min) / ma_min * 100 >= 2.5
+                cluster_pct = (ma_max - ma_min) / ma_min * 100
+                ma_loose = (cluster_pct >= 2.5) or (change_pct >= 3.0)
 
         if mode == "A":
             triggered = (has_ut and ut_above_trail and
@@ -2231,36 +2233,30 @@ def api_why(sid):
     ma_loose = True; ma_cluster_pct = None
     if len(ma_vals) >= 3 and min(ma_vals)>0:
         ma_cluster_pct = (max(ma_vals)-min(ma_vals))/min(ma_vals)*100
-        ma_loose = ma_cluster_pct >= 2.5
-    gates = {
-        "成交量≥20張": vol >= 20,
-        "排除產業":     not industry_excluded,
-        "has_UT":      has_ut,
-        "has_費波南":   has_fib,
-        "has_威廉":     has_wr,
-        "has_背離":     has_div,
-        "UT在追蹤線上": ut_above_trail,
-        "費波南在MA上": fib_above_ma,
-        "未跌≥1%":      not_falling,
-        "現價在短MA上": above_short_ma,
-        "量比≥1.2":     vol_ratio_ok,
-        "漲幅≥1%":      rising_strong,
-        f"MA偏差≥2.5%（實際{ma_cluster_pct:.2f}%）" if ma_cluster_pct else "MA偏差≥2.5%": ma_loose,
-        f"確認分>4（實際{confirm_score}）": confirm_score > 4,
+        ma_loose = (ma_cluster_pct >= 2.5) or (change_pct >= 3.0)
+    ma_gate_name = f"MA偏差≥2.5%或漲幅≥3%（實際偏差{ma_cluster_pct:.2f}%）" if ma_cluster_pct else "MA偏差≥2.5%或漲幅≥3%"
+    common = {
+        "成交量≥20張":  vol >= 20,
+        "排除產業":      not industry_excluded,
+        "UT在追蹤線上":  ut_above_trail,
+        "未跌≥1%":       not_falling,
+        "現價在短MA上":  above_short_ma,
+        "量比≥1.2":      vol_ratio_ok,
+        "漲幅≥1%":       rising_strong,
+        ma_gate_name:    ma_loose,
     }
     if mode == "A":
-        required = ["成交量≥20張","排除產業","has_UT","has_威廉","has_背離","UT在追蹤線上",
-                    "未跌≥1%","現價在短MA上","量比≥1.2","漲幅≥1%"]
+        gates = {**common, "has_UT":has_ut, "has_威廉":has_wr, "has_背離":has_div}
     elif mode == "B":
-        required = ["成交量≥20張","排除產業","has_UT","has_費波南","UT在追蹤線上","費波南在MA上",
-                    "未跌≥1%","現價在短MA上","量比≥1.2","漲幅≥1%"]
+        gates = {**common, "has_UT":has_ut, "has_費波南":has_fib, "費波南在MA上":fib_above_ma}
     else:  # C
-        required = list(gates.keys())  # 所有都要
-    failed = [k for k in gates if k.startswith(tuple(req.split("（")[0] for req in required))
-              if not any(gates[g] for g in [k])]
+        gates = {**common, "has_UT":has_ut, "has_費波南":has_fib, "has_威廉":has_wr,
+                 "費波南在MA上":fib_above_ma,
+                 f"確認分>4（實際{confirm_score}）": confirm_score > 4}
+    passed = all(gates.values())
     fails = {k:v for k,v in gates.items() if not v}
     return jsonify({"sid":sid, "name":r.get("name",""), "industry":ind,
-        "mode":mode, "passed_C": all(gates.values()),
+        "mode":mode, "passed": passed,
         "values":{
             "close":close,"change_pct":round(change_pct,2),"volume":vol,
             "vol_ratio":round(vol_ratio,2),"ma5":ma5,"ma10":ma10,"ma20":ma20,"ma60":ma60,
