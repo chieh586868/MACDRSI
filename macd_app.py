@@ -1896,31 +1896,28 @@ def api_scan_condition_d():
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
 
-# ── 週 MACD 多頭快取（給條件 C 用，1天內共用）─────────────
-_weekly_macd_cache = {}
+# ── 週 MACD 多頭快取（7 天內共用，因週線一週才變一次）─────
+_weekly_macd_cache = {}   # sid -> (bool, timestamp)
 _weekly_macd_lock  = threading.Lock()
-_weekly_macd_date  = ""
+_WEEKLY_CACHE_TTL  = 7 * 24 * 3600  # 7 天
 
 def _check_weekly_macd_bull(sid: str, ex: str = "tse") -> bool:
-    """回傳該股票週 MACD 是否多頭（DIF > DEA）。日內共用快取。"""
-    global _weekly_macd_date
-    today = datetime.now().strftime("%Y-%m-%d")
+    """回傳該股票週 MACD 是否多頭（DIF > DEA）。7 天內共用快取。"""
+    now_ts = time.time()
     with _weekly_macd_lock:
-        if _weekly_macd_date != today:
-            _weekly_macd_cache.clear()
-            _weekly_macd_date = today
-        if sid in _weekly_macd_cache:
-            return _weekly_macd_cache[sid]
+        entry = _weekly_macd_cache.get(sid)
+        if entry and (now_ts - entry[1]) < _WEEKLY_CACHE_TTL:
+            return entry[0]
     try:
         df = fetch_history(sid, period="1y", ex=ex)
         if len(df) < 60:
-            with _weekly_macd_lock: _weekly_macd_cache[sid] = False
+            with _weekly_macd_lock: _weekly_macd_cache[sid] = (False, now_ts)
             return False
         df.index = pd.to_datetime(df.index)
         wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
                                           "Close":"last","Volume":"sum"}).dropna()
         if len(wdf) < 30:
-            with _weekly_macd_lock: _weekly_macd_cache[sid] = False
+            with _weekly_macd_lock: _weekly_macd_cache[sid] = (False, now_ts)
             return False
         wc = wdf["Close"].values.astype(float)
         ema12 = pd.Series(wc).ewm(span=12, adjust=False).mean().values
@@ -1928,7 +1925,7 @@ def _check_weekly_macd_bull(sid: str, ex: str = "tse") -> bool:
         dif   = ema12 - ema26
         dea   = pd.Series(dif).ewm(span=9, adjust=False).mean().values
         bull  = bool(dif[-1] > dea[-1])
-        with _weekly_macd_lock: _weekly_macd_cache[sid] = bull
+        with _weekly_macd_lock: _weekly_macd_cache[sid] = (bull, now_ts)
         return bull
     except Exception:
         with _weekly_macd_lock: _weekly_macd_cache[sid] = False

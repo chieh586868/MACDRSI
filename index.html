@@ -313,11 +313,9 @@ function scan(mode) {
   fetch('/api/scan')
     .then(r => r.json())
     .then(() => {
-      // C 走嚴格端點（含週MACD多頭），D 走背離端點，A/B 走 buysignal
-      let url;
-      if (mode === 'D')      url = '/api/scan/condition_d';
-      else if (mode === 'C') url = '/api/scan/condition_c_strict';
-      else                   url = `/api/scan/buysignal?mode=${mode}`;
+      // D 走背離端點，其餘走 buysignal
+      const url = (mode === 'D') ? '/api/scan/condition_d'
+                                 : `/api/scan/buysignal?mode=${mode}`;
       return fetch(url);
     })
     .then(r => r.json())
@@ -346,13 +344,10 @@ function setBtns(disabled) {
 function filter(mode) {
   currentMode = mode;
   setBtns(true);
-  const slow = (mode === 'C' || mode === 'D');
-  setInfo(`過濾條件 ${mode} 中...${slow?'（需週線資料，~10-30秒）':''}`, '');
+  setInfo(`過濾條件 ${mode} 中...${mode==='D'?'（D 需重抓1年資料，~10-30秒）':''}`, '');
   const t0 = Date.now();
-  let url;
-  if (mode === 'D')      url = '/api/scan/condition_d';
-  else if (mode === 'C') url = '/api/scan/condition_c_strict';
-  else                   url = `/api/scan/buysignal?mode=${mode}`;
+  const url = (mode === 'D') ? '/api/scan/condition_d'
+                             : `/api/scan/buysignal?mode=${mode}`;
   fetch(url)
     .then(r => r.json())
     .then(data => {
