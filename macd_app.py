@@ -1177,6 +1177,7 @@ def analyze_stock(stock: dict) -> dict:
         "ma5":  _last_scalar(ind.get("ma5",  pd.Series([0]))) if ind else 0,
         "ma10": _last_scalar(ind.get("ma10", pd.Series([0]))) if ind else 0,
         "ma20": _last_scalar(ind.get("ma20", pd.Series([0]))) if ind else 0,
+        "ma60": _last_scalar(ind.get("ma60", pd.Series([0]))) if ind else 0,
         "dif":  _last_scalar(ind.get("dif",  pd.Series([0]))) if ind else 0,
         "dea":  _last_scalar(ind.get("dea",  pd.Series([0]))) if ind else 0,
         "hist": _last_scalar(ind.get("hist", pd.Series([0]))) if ind else 0,
@@ -1417,6 +1418,38 @@ def send_telegram(msg):
     except: return False
 
 
+# 手動掃描完成時的去重快取（同 mode 5分鐘內不重複推送）
+_manual_push_last = {}
+_manual_push_lock = threading.Lock()
+
+def push_scan_summary(mode: str, rows: list, max_show: int = 15):
+    """掃描完成時把結果摘要推到 Telegram，5 分鐘內同 mode 不重發"""
+    if not telegram_enabled or not TELEGRAM_TOKEN: return
+    if not rows: return
+    with _manual_push_lock:
+        last = _manual_push_last.get(mode)
+        if last and (datetime.now() - last).total_seconds() < 300:
+            return
+        _manual_push_last[mode] = datetime.now()
+    mode_label = {"A":"UT+威廉+背離","B":"UT+費波南","C+":"UT+費費+威廉+週MACD多頭","D":"日週雙重背離"}.get(mode, mode)
+    lines = [f"📊 <b>條件 {mode} 掃描完成</b>",
+             f"🕐 {datetime.now().strftime('%H:%M:%S')}  找到 {len(rows)} 支",
+             f"📋 {mode_label}", ""]
+    for i, r in enumerate(rows[:max_show], 1):
+        c = r.get("change_pct", 0)
+        arrow = "▲" if c > 0 else "▼"
+        lines.append(f"{i}. <b>{r.get('name','')}({r.get('id','')})</b> "
+                     f"${r.get('close',0):.2f} {arrow}{abs(c):.2f}% "
+                     f"量{r.get('volume',0)}")
+    if len(rows) > max_show:
+        lines.append(f"...另 {len(rows)-max_show} 支")
+    lines.append("\n⚠ 僅供參考")
+    try:
+        send_telegram("\n".join(lines))
+    except Exception:
+        pass
+
+
 # ══════════════════════════════════════════════════════════
 # ▌ 定時排程
 # ══════════════════════════════════════════════════════════
@@ -1635,16 +1668,27 @@ def api_scan_buysignal():
         vol_ratio_ok = r.get("vol_ratio", 0) >= 1.2
         rising_strong = change_pct >= 1.0
 
+        # MA 緊纏排除：MA5/MA10/MA20/MA60 偏差 < 2.5% 視為橫盤無動能
+        ma60 = r.get("ma60", 0)
+        ma_vals = [v for v in (ma5, ma10, ma20, ma60) if v > 0]
+        ma_loose = True
+        if len(ma_vals) >= 3:
+            ma_max = max(ma_vals); ma_min = min(ma_vals)
+            if ma_min > 0:
+                ma_loose = (ma_max - ma_min) / ma_min * 100 >= 2.5
+
         if mode == "A":
             triggered = (has_ut and ut_above_trail and
                          has_wr and has_div and
                          not_falling and above_short_ma and
-                         vol_ratio_ok and rising_strong)
+                         vol_ratio_ok and rising_strong and
+                         ma_loose)
         elif mode == "B":
             triggered = (has_ut and ut_above_trail and
                          has_fib and fib_above_ma and
                          not_falling and above_short_ma and
-                         vol_ratio_ok and rising_strong)
+                         vol_ratio_ok and rising_strong and
+                         ma_loose)
         elif mode == "C":
             confirm_score = (r.get("confirm") or {}).get("score", 0)
             triggered = (has_ut and ut_above_trail and
@@ -1652,7 +1696,8 @@ def api_scan_buysignal():
                          has_wr and
                          not_falling and above_short_ma and
                          confirm_score > 4 and
-                         vol_ratio_ok and rising_strong)
+                         vol_ratio_ok and rising_strong and
+                         ma_loose)
         elif mode == "D":
             div_score    = div.get("score", 0)
             regular_cnt  = div.get("regular_count", 0)
@@ -1690,6 +1735,7 @@ def api_scan_buysignal():
             -(x.get("confirm") or {}).get("score", 0),
             -x.get("change_pct", 0),
         ))
+    push_scan_summary(mode, results)
     return jsonify(sanitize({"data":results,"total":len(cached),"hit_count":len(results),"mode":mode,
                     "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
@@ -1843,10 +1889,123 @@ def api_scan_condition_d():
         -(x.get("div") or {}).get("score", 0),
         -x.get("change_pct", 0),
     ))
+    push_scan_summary("D", hits)
     return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
                               "mode":"D","candidates":len(candidates),
                               "strong_count":sum(1 for h in hits if h.get("strong_resonance")),
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+
+# ── 週 MACD 多頭快取（給條件 C 用，1天內共用）─────────────
+_weekly_macd_cache = {}
+_weekly_macd_lock  = threading.Lock()
+_weekly_macd_date  = ""
+
+def _check_weekly_macd_bull(sid: str, ex: str = "tse") -> bool:
+    """回傳該股票週 MACD 是否多頭（DIF > DEA）。日內共用快取。"""
+    global _weekly_macd_date
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _weekly_macd_lock:
+        if _weekly_macd_date != today:
+            _weekly_macd_cache.clear()
+            _weekly_macd_date = today
+        if sid in _weekly_macd_cache:
+            return _weekly_macd_cache[sid]
+    try:
+        df = fetch_history(sid, period="1y", ex=ex)
+        if len(df) < 60:
+            with _weekly_macd_lock: _weekly_macd_cache[sid] = False
+            return False
+        df.index = pd.to_datetime(df.index)
+        wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
+                                          "Close":"last","Volume":"sum"}).dropna()
+        if len(wdf) < 30:
+            with _weekly_macd_lock: _weekly_macd_cache[sid] = False
+            return False
+        wc = wdf["Close"].values.astype(float)
+        ema12 = pd.Series(wc).ewm(span=12, adjust=False).mean().values
+        ema26 = pd.Series(wc).ewm(span=26, adjust=False).mean().values
+        dif   = ema12 - ema26
+        dea   = pd.Series(dif).ewm(span=9, adjust=False).mean().values
+        bull  = bool(dif[-1] > dea[-1])
+        with _weekly_macd_lock: _weekly_macd_cache[sid] = bull
+        return bull
+    except Exception:
+        with _weekly_macd_lock: _weekly_macd_cache[sid] = False
+        return False
+
+
+@app.route("/api/scan/condition_c_strict", methods=["GET"])
+def api_scan_condition_c_strict():
+    """條件 C 嚴格版：在 cache 過濾通過後，再要求週 MACD 多頭。
+    第一次跑會慢（每支抓 1y 資料），同日內第二次以後用 cache。"""
+    with cache_lock: cached = list(cache.values())
+    if not cached:
+        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"C+"}), 400
+
+    # 先用 cache 跑一次條件 C 的判斷
+    candidates = []
+    for r in cached:
+        if r.get("volume",0) < 20: continue
+        has_fib = bool(r.get("fib",{}).get("buy_signals"))
+        has_ut  = bool(r.get("ut_buy"))
+        has_wr  = bool(r.get("wr",{}).get("buy_signals"))
+        close      = r.get("close", 0)
+        ma5        = r.get("ma5",   0); ma10 = r.get("ma10",0)
+        ma20       = r.get("ma20",  0); ma60 = r.get("ma60",0)
+        ut_trail   = r.get("ut_trail", 0)
+        change_pct = r.get("change_pct", 0)
+        fib_detail = r.get("fib",{}).get("details",{})
+        fib_ma3    = fib_detail.get("ma3", ma5); fib_ma5 = fib_detail.get("ma5", ma5)
+        fib_above_ma = close > 0 and (
+            (fib_ma3 > 0 and close >= fib_ma3 * 0.995) or
+            (fib_ma5 > 0 and close >= fib_ma5 * 0.995) or
+            (ma5     > 0 and close >= ma5     * 0.995))
+        ut_above_trail = close > 0 and (ut_trail <= 0 or close >= ut_trail * 0.995)
+        not_falling    = change_pct >= -1.0
+        above_short_ma = close > 0 and (
+            (ma5  > 0 and close >= ma5  * 0.995) or
+            (ma10 > 0 and close >= ma10 * 0.995))
+        vol_ratio_ok  = r.get("vol_ratio",0) >= 1.2
+        rising_strong = change_pct >= 1.0
+        ma_vals = [v for v in (ma5, ma10, ma20, ma60) if v > 0]
+        ma_loose = True
+        if len(ma_vals) >= 3 and min(ma_vals) > 0:
+            ma_loose = (max(ma_vals) - min(ma_vals)) / min(ma_vals) * 100 >= 2.5
+        confirm_score = (r.get("confirm") or {}).get("score",0)
+        if (has_ut and ut_above_trail and has_fib and fib_above_ma and has_wr and
+            not_falling and above_short_ma and confirm_score > 4 and
+            vol_ratio_ok and rising_strong and ma_loose):
+            candidates.append(r)
+
+    if not candidates:
+        return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"C+",
+                                  "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+    # 對 candidates on-demand 檢查週 MACD 多頭
+    def check(r):
+        sid = r.get("id"); ex = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
+        return r if _check_weekly_macd_bull(sid, ex) else None
+
+    hits = []
+    futures = {_global_executor.submit(check, r): r for r in candidates}
+    for f in as_completed(futures):
+        try:
+            res = f.result(timeout=20)
+            if res:
+                res = dict(res); res["weekly_macd_bull"] = True; res["buy_mode"] = "C+"
+                hits.append(res)
+        except Exception: pass
+
+    hits.sort(key=lambda x: (
+        -(x.get("confirm") or {}).get("score", 0),
+        -x.get("change_pct", 0),
+    ))
+    push_scan_summary("C+", hits)
+    return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
+                              "mode":"C+","candidates":len(candidates),
+                              "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
@@ -1983,6 +2142,41 @@ def api_debug(sid):
     return jsonify({"rt":rt,"has_history":len(hist)>=30,"hist_rows":len(hist),
         "hist_last_date":str(hist.index[-1].date()) if len(hist)>0 else None,
         "hist_cached":bool(_get_hist_cache(_hist_key(sid,"3mo",ex)))})
+
+@app.route("/api/export/csv", methods=["POST"])
+def api_export_csv():
+    """前端把當前顯示的列表 POST 過來，回傳 CSV 檔案"""
+    from flask import Response
+    import csv, io
+    payload = request.get_json(silent=True) or {}
+    rows = payload.get("rows", [])
+    mode = payload.get("mode", "X")
+    if not rows:
+        return jsonify({"error":"沒有資料"}), 400
+    buf = io.StringIO()
+    buf.write("﻿")  # BOM for Excel UTF-8
+    w = csv.writer(buf)
+    w.writerow(["#","股號","名稱","現價","漲跌","漲跌幅%","成交量(張)","量比",
+                "MA5","MA10","MA20","MA60","背離分數","週背離分數","訊號"])
+    for i, r in enumerate(rows, 1):
+        div = r.get("div") or {}
+        sigs = []
+        if r.get("ut_buy"): sigs.append("UT")
+        if (r.get("fib") or {}).get("buy_signals"): sigs.append("費波南")
+        if (r.get("wr")  or {}).get("buy_signals"): sigs.append("威廉波浪")
+        if div.get("buy_signals") or div.get("score",0)>=2: sigs.append(f"背離{div.get('score',0)}")
+        w.writerow([i, r.get("id",""), r.get("name",""),
+                    r.get("close",0), r.get("change",0), r.get("change_pct",0),
+                    r.get("volume",0), r.get("vol_ratio",0),
+                    r.get("ma5",0), r.get("ma10",0), r.get("ma20",0), r.get("ma60",0),
+                    div.get("score",0), r.get("weekly_score",""),
+                    " ".join(sigs)])
+    csv_data = buf.getvalue()
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    fname = f"scan_{mode}_{ts}.csv"
+    return Response(csv_data, mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={fname}"})
+
 
 @app.route("/")
 def index():

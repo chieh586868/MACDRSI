@@ -180,6 +180,7 @@ tr:hover { background: #161b22; }
   <button class="btn btn-mini btn-filter" onclick="filter('B')">B</button>
   <button class="btn btn-mini btn-filter" onclick="filter('C')">C</button>
   <button class="btn btn-mini btn-filter" onclick="filter('D')">D</button>
+  <button class="btn btn-mini" style="background:#10b981;margin-left:auto" onclick="exportCSV()">📥 匯出 CSV</button>
 </div>
 
 <!-- INFO -->
@@ -299,6 +300,7 @@ function tgTest() {
 
 // ── 掃描 ──
 function scan(mode) {
+  currentMode = mode;
   setBtns(true);
   document.getElementById('tbl').style.display = 'none';
   document.getElementById('empty').style.display = 'block';
@@ -311,9 +313,11 @@ function scan(mode) {
   fetch('/api/scan')
     .then(r => r.json())
     .then(() => {
-      // 條件 D 走專屬端點（日週雙重背離），其餘走 buysignal 過濾
-      const url = (mode === 'D') ? '/api/scan/condition_d'
-                                 : `/api/scan/buysignal?mode=${mode}`;
+      // C 走嚴格端點（含週MACD多頭），D 走背離端點，A/B 走 buysignal
+      let url;
+      if (mode === 'D')      url = '/api/scan/condition_d';
+      else if (mode === 'C') url = '/api/scan/condition_c_strict';
+      else                   url = `/api/scan/buysignal?mode=${mode}`;
       return fetch(url);
     })
     .then(r => r.json())
@@ -340,11 +344,15 @@ function setBtns(disabled) {
 
 // 只用已掃描結果再過濾，不重新跑 /api/scan
 function filter(mode) {
+  currentMode = mode;
   setBtns(true);
-  setInfo(`過濾條件 ${mode} 中...${mode==='D'?'（D 需重抓1年資料，~10-30秒）':''}`, '');
+  const slow = (mode === 'C' || mode === 'D');
+  setInfo(`過濾條件 ${mode} 中...${slow?'（需週線資料，~10-30秒）':''}`, '');
   const t0 = Date.now();
-  const url = (mode === 'D') ? '/api/scan/condition_d'
-                             : `/api/scan/buysignal?mode=${mode}`;
+  let url;
+  if (mode === 'D')      url = '/api/scan/condition_d';
+  else if (mode === 'C') url = '/api/scan/condition_c_strict';
+  else                   url = `/api/scan/buysignal?mode=${mode}`;
   fetch(url)
     .then(r => r.json())
     .then(data => {
@@ -369,6 +377,7 @@ function setInfo(msg, type) {
 }
 
 function render(rows) {
+  currentRows = rows || [];
   if (!rows || !rows.length) {
     document.getElementById('tbl').style.display = 'none';
     document.getElementById('empty').style.display = 'block';
@@ -395,6 +404,28 @@ function render(rows) {
     </tr>`;
   }).join('');
   document.getElementById('rows').innerHTML = html;
+}
+
+// 全域存當前顯示的列表（給 CSV 匯出用）
+let currentRows = [];
+let currentMode = "X";
+
+function exportCSV() {
+  if (!currentRows.length) {
+    setInfo('✗ 沒有資料可匯出，請先執行掃描', 'err'); return;
+  }
+  fetch('/api/export/csv', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rows: currentRows, mode: currentMode})
+  }).then(r => r.blob()).then(blob => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `scan_${currentMode}_${Date.now()}.csv`;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+    setInfo(`✓ 已匯出 ${currentRows.length} 支`, 'ok');
+  }).catch(e => setInfo(`✗ 匯出失敗：${e.message}`, 'err'));
 }
 
 function formatVol(v) {
