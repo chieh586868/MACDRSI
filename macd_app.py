@@ -1302,7 +1302,10 @@ def analyze_stock_fast(stock: dict):
     now = datetime.now()
     t_min = now.hour * 60 + now.minute
     is_trading = (9*60 <= t_min <= 13*60+35) and (now.weekday() < 5)
-    if cached and cached.get("has_data") and not is_trading:
+    # 休市時直接用 cache（不重算）；但若是舊版 cache（缺 prev_close 欄位）或
+    # vol_ratio 異常為 0（舊版休市抓報價 volume=0 算壞），則強制重算修正。
+    cache_is_fresh = (cached and "prev_close" in cached and cached.get("vol_ratio", 0) > 0)
+    if cached and cached.get("has_data") and not is_trading and cache_is_fresh:
         updated = dict(cached)
         updated["scanned_at"] = datetime.now().strftime("%H:%M:%S")
         updated["rt_source"]  = "cache_offhour"
