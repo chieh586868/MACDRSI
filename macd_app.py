@@ -2519,7 +2519,7 @@ def api_export_csv():
     buf.write("﻿")  # BOM for Excel UTF-8
     w = csv.writer(buf)
     w.writerow(["#","股號","名稱","現價","漲跌","漲跌幅%","成交量(張)","量比",
-                "MA5","MA10","MA20","MA60","背離分數","週背離分數","訊號"])
+                "MA5","MA10","MA20","MA60","背離分數","週背離分數","來源","訊號"])
     for i, r in enumerate(rows, 1):
         div = r.get("div") or {}
         sigs = []
@@ -2527,11 +2527,12 @@ def api_export_csv():
         if (r.get("fib") or {}).get("buy_signals"): sigs.append("費波南")
         if (r.get("wr")  or {}).get("buy_signals"): sigs.append("威廉波浪")
         if div.get("buy_signals") or div.get("score",0)>=2: sigs.append(f"背離{div.get('score',0)}")
+        source = "DB延遲確認" if r.get("db_delayed") else "即時"
         w.writerow([i, r.get("id",""), r.get("name",""),
                     r.get("close",0), r.get("change",0), r.get("change_pct",0),
                     r.get("volume",0), r.get("vol_ratio",0),
                     r.get("ma5",0), r.get("ma10",0), r.get("ma20",0), r.get("ma60",0),
-                    div.get("score",0), r.get("weekly_score",""),
+                    div.get("score",0), r.get("weekly_score",""), source,
                     " ".join(sigs)])
     csv_data = buf.getvalue()
     ts = datetime.now().strftime("%Y%m%d_%H%M")

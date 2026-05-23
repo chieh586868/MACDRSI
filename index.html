@@ -397,10 +397,14 @@ function render(rows) {
     const chg = r.change || 0;
     const cls = pct > 0 ? 'up' : pct < 0 ? 'dn' : 'flat';
     const arrow = pct > 0 ? '▲' : pct < 0 ? '▼' : '─';
-    return `<tr>
+    const dbTag = r.db_delayed
+      ? ` <span title="${(r.buy_reasons||[]).join(' / ')}" style="background:#facc15;color:#1e293b;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;vertical-align:middle">延遲確認</span>`
+      : '';
+    const rowStyle = r.db_delayed ? ' style="background:rgba(250,204,21,0.08)"' : '';
+    return `<tr${rowStyle}>
       <td>${i+1}</td>
       <td class="sid">${r.id}</td>
-      <td class="sname">${r.name || ''}</td>
+      <td class="sname">${r.name || ''}${dbTag}</td>
       <td class="r price">${(r.close||0).toFixed(2)}</td>
       <td class="r ${cls}">${arrow} ${Math.abs(chg).toFixed(2)}</td>
       <td class="r ${cls}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
