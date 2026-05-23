@@ -525,6 +525,14 @@ def _last_scalar(s, default=0.0):
     except Exception:
         return default
 
+def _prev_scalar(s, default=0.0):
+    """倒數第二個值（1 日前）"""
+    try:
+        v = s.values[-2]
+        return default if v != v else float(v)
+    except Exception:
+        return default
+
 def eval_strategies(ind: dict, closes: pd.Series, volumes: pd.Series) -> list:
     if len(closes) < 3:
         return []
@@ -1068,6 +1076,13 @@ def fetch_realtime_price(stock_id, ex="tse"):
         if time.time() - _rt_batch_time < _RT_BATCH_TTL:
             rt = _rt_batch_cache.get(stock_id)
             if rt and rt.get("close",0) > 0: return rt
+    # 非交易時段不逐支連網：冷啟動時逐支打 Shioaji/TWSE/Yahoo 會全部 timeout，
+    # 把整體掃描拖到 30 分鐘。休市時直接回 None，改用歷史最後一根 K 線。
+    now = datetime.now()
+    t_min = now.hour * 60 + now.minute
+    is_trading = (9*60 <= t_min <= 13*60+35) and (now.weekday() < 5)
+    if not is_trading:
+        return None
     if _sj_ready:
         rt = fetch_shioaji_batch([stock_id]).get(stock_id)
         if rt and rt.get("close",0) > 0: return rt
@@ -1179,6 +1194,9 @@ def analyze_stock(stock: dict) -> dict:
         "ma10": _last_scalar(ind.get("ma10", pd.Series([0]))) if ind else 0,
         "ma20": _last_scalar(ind.get("ma20", pd.Series([0]))) if ind else 0,
         "ma60": _last_scalar(ind.get("ma60", pd.Series([0]))) if ind else 0,
+        "prev_close": _prev_scalar(closes) if has_history else 0,
+        "prev_ma5":   _prev_scalar(ind.get("ma5",  pd.Series([0]))) if ind else 0,
+        "prev_ma10":  _prev_scalar(ind.get("ma10", pd.Series([0]))) if ind else 0,
         "dif":  _last_scalar(ind.get("dif",  pd.Series([0]))) if ind else 0,
         "dea":  _last_scalar(ind.get("dea",  pd.Series([0]))) if ind else 0,
         "hist": _last_scalar(ind.get("hist", pd.Series([0]))) if ind else 0,
@@ -1798,19 +1816,26 @@ def api_scan_buysignal():
         vol_ratio_ok = r.get("vol_ratio", 0) >= 1.2
         rising_strong = change_pct >= 1.0
 
-        # MA 緊纏 + 沒突破才排除：MA 偏差 < 2.5% 且 漲幅 < 3% = 真橫盤無動能
-        # （1525 江申類「緊纏後突破」+9.8% 要保留）
+        # MA 緊纏 + 沒突破才排除（橫盤無動能）。放行條件：
+        #   (量比≥2.5 AND 漲幅≥2%)  ← 爆量起跑
+        #   OR 前一日收盤 < 前一日MA5  OR 前一日收盤 < 前一日MA10  ← 昨天還在均線下方，今天剛突破
         ma60 = r.get("ma60", 0)
+        prev_close = r.get("prev_close", 0)
+        prev_ma5   = r.get("prev_ma5", 0)
+        prev_ma10  = r.get("prev_ma10", 0)
+        below_ma_yesterday = (
+            (prev_ma5  > 0 and prev_close > 0 and prev_close < prev_ma5) or
+            (prev_ma10 > 0 and prev_close > 0 and prev_close < prev_ma10)
+        )
         ma_vals = [v for v in (ma5, ma10, ma20, ma60) if v > 0]
         ma_loose = True
         if len(ma_vals) >= 3:
             ma_max = max(ma_vals); ma_min = min(ma_vals)
             if ma_min > 0:
                 cluster_pct = (ma_max - ma_min) / ma_min * 100
-                # 量價共振突破：MA 緊纏時，需「量比≥2.5 AND 漲幅≥2%」才認定為爆量起跑
                 ma_loose = (cluster_pct >= 2.5) or (
                     r.get("vol_ratio", 0) >= 2.5 and change_pct >= 2.0
-                )
+                ) or below_ma_yesterday
 
         if mode == "A":
             triggered = (has_ut and ut_above_trail and
@@ -2305,13 +2330,20 @@ def api_why(sid):
                                    (ma10>0 and close>=ma10*0.995))
     vol_ratio_ok = vol_ratio >= 1.2
     rising_strong = change_pct >= 1.0
+    prev_close = r.get("prev_close", 0)
+    prev_ma5   = r.get("prev_ma5", 0)
+    prev_ma10  = r.get("prev_ma10", 0)
+    below_ma_yesterday = (
+        (prev_ma5  > 0 and prev_close > 0 and prev_close < prev_ma5) or
+        (prev_ma10 > 0 and prev_close > 0 and prev_close < prev_ma10)
+    )
     ma_vals = [v for v in (ma5,ma10,ma20,ma60) if v>0]
     ma_loose = True; ma_cluster_pct = None
     if len(ma_vals) >= 3 and min(ma_vals)>0:
         ma_cluster_pct = (max(ma_vals)-min(ma_vals))/min(ma_vals)*100
-        ma_loose = (ma_cluster_pct >= 2.5) or (vol_ratio >= 2.5 and change_pct >= 2.0)
-    ma_gate_name = (f"MA偏差≥2.5%或(量比≥2.5且漲幅≥2%)（實際偏差{ma_cluster_pct:.2f}%）"
-                    if ma_cluster_pct else "MA偏差≥2.5%或(量比≥2.5且漲幅≥2%)")
+        ma_loose = (ma_cluster_pct >= 2.5) or (vol_ratio >= 2.5 and change_pct >= 2.0) or below_ma_yesterday
+    ma_gate_name = (f"MA偏差≥2.5%或量價共振或昨日在均線下（實際偏差{ma_cluster_pct:.2f}%, 昨收{prev_close} vs 昨MA5={prev_ma5:.2f}/MA10={prev_ma10:.2f}）"
+                    if ma_cluster_pct else "MA偏差≥2.5%或量價共振或昨日在均線下")
     common = {
         "成交量≥20張":  vol >= 20,
         "排除產業":      not industry_excluded,
