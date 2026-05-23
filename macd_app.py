@@ -395,6 +395,61 @@ def _load_scan_cache_disk() -> bool:
 
 
 # ══════════════════════════════════════════════════════════
+# ▌ 背離歷史資料庫（滾動 7 天，給條件 A/D 撈「幾天前背離、今天確認」）
+# ══════════════════════════════════════════════════════════
+import sqlite3
+DIVERGENCE_DB   = "divergence_history.db"
+DIV_DB_MIN      = 5          # 背離分數 ≥ 5 才寫入
+DIV_DB_DAYS     = 7          # 保留滾動 7 天
+_div_db_lock    = threading.Lock()
+
+def _init_div_db():
+    try:
+        with sqlite3.connect(DIVERGENCE_DB) as con:
+            con.execute("""CREATE TABLE IF NOT EXISTS divergence_history(
+                sid TEXT, name TEXT, date TEXT,
+                daily_div INTEGER, weekly_div INTEGER, close REAL,
+                PRIMARY KEY(sid, date))""")
+    except Exception as e:
+        print(f"  ⚠ 背離DB初始化失敗: {e}")
+
+def record_divergence(results: list, min_div: int = DIV_DB_MIN):
+    """掃描完成後，把背離分數 ≥ min_div 的個股寫進 DB（同日覆寫），並清掉 7 天前的"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = []
+    for r in results:
+        d = (r.get("div") or {}).get("score", 0)
+        if d >= min_div:
+            rows.append((r.get("id"), r.get("name",""), today, int(d),
+                         int(r.get("weekly_score", 0) or 0), float(r.get("close", 0) or 0)))
+    if not rows:
+        return 0
+    cutoff = (datetime.now() - timedelta(days=DIV_DB_DAYS)).strftime("%Y-%m-%d")
+    try:
+        with _div_db_lock, sqlite3.connect(DIVERGENCE_DB) as con:
+            con.executemany("""INSERT OR REPLACE INTO divergence_history
+                (sid,name,date,daily_div,weekly_div,close) VALUES (?,?,?,?,?,?)""", rows)
+            con.execute("DELETE FROM divergence_history WHERE date < ?", (cutoff,))
+        return len(rows)
+    except Exception as e:
+        print(f"  ⚠ 背離DB寫入失敗: {e}")
+        return 0
+
+def get_recent_divergence(days: int = DIV_DB_DAYS, min_div: int = DIV_DB_MIN) -> dict:
+    """回傳 {sid: {div, last_date}}：過去 days 天內背離 ≥ min_div 的個股（取最高分）"""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        with _div_db_lock, sqlite3.connect(DIVERGENCE_DB) as con:
+            cur = con.execute("""SELECT sid, MAX(daily_div), MAX(date)
+                FROM divergence_history WHERE date >= ? AND daily_div >= ?
+                GROUP BY sid""", (cutoff, min_div))
+            return {row[0]: {"div": row[1], "last_date": row[2]} for row in cur.fetchall()}
+    except Exception as e:
+        print(f"  ⚠ 背離DB讀取失敗: {e}")
+        return {}
+
+
+# ══════════════════════════════════════════════════════════
 # ▌ 一次計算所有技術指標（★ 全 numba JIT）
 # ══════════════════════════════════════════════════════════
 def calc_all_indicators(closes: pd.Series, highs: pd.Series,
@@ -1611,6 +1666,8 @@ def auto_scan_job():
     results = batch_scan_all()
     if not results: return
     elapsed = round(time.time()-t0,1)
+    try: record_divergence(results)
+    except Exception: pass
     for r in results:
         try: add_to_watchlist2(r, min_score=3)
         except: pass
@@ -1665,6 +1722,10 @@ def api_scan():
         time.sleep(5); print(f"  ⏳ 等待預載... ({len(hist_cache)}/{len(watchlist)})")
     try:
         results = batch_scan_all()
+        try:
+            n_rec = record_divergence(results)
+            if n_rec: print(f"  🗄 背離DB：寫入 {n_rec} 檔（背離≥{DIV_DB_MIN}）")
+        except Exception: pass
         for r in results:
             try: add_to_watchlist2(r, min_score=3)
             except: pass
@@ -1772,6 +1833,9 @@ def api_scan_utbot():
 def api_scan_buysignal():
     mode = request.args.get("mode","A")
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
+    use_db = request.args.get("use_db","1") != "0"
+    # 條件 A 擴充：過去 7 天背離≥5 的個股（DB），今天有 UT 買訊就補進來
+    recent_div = get_recent_divergence() if (mode == "A" and use_db) else {}
     with cache_lock: cached = list(cache.values())
     results = []
     for r in cached:
@@ -1837,12 +1901,18 @@ def api_scan_buysignal():
                     r.get("vol_ratio", 0) >= 2.5 and change_pct >= 2.0
                 ) or below_ma_yesterday
 
+        db_delayed = False
         if mode == "A":
             triggered = (has_ut and ut_above_trail and
                          has_wr and has_div and
                          not_falling and above_short_ma and
                          vol_ratio_ok and rising_strong and
                          ma_loose)
+            # DB 擴充：過去7天背離≥5 + 今日UT買訊（不要求今日WR/今日背離）
+            if not triggered and r.get("id") in recent_div and \
+               has_ut and ut_above_trail and not_falling and above_short_ma:
+                triggered = True
+                db_delayed = True
         elif mode == "B":
             triggered = (has_ut and ut_above_trail and
                          has_fib and fib_above_ma and
@@ -1882,6 +1952,10 @@ def api_scan_buysignal():
                 r["buy_reasons"].append(f"威廉[{wr_ids}]")
             if has_div:
                 r["buy_reasons"].append(f"背離({div.get('score',0)}分)")
+            if db_delayed:
+                info = recent_div.get(r.get("id"), {})
+                r["db_delayed"] = True
+                r["buy_reasons"].append(f"DB背離{info.get('div','')}分@{info.get('last_date','')}+今日UT")
             results.append(r)
 
     if mode == "D":
@@ -1971,6 +2045,30 @@ def api_scan_divergence():
         "div_type":div_type,"min_score":min_score,
         "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
+@app.route("/api/divergence_db", methods=["GET"])
+def api_divergence_db():
+    """查看背離資料庫累積內容（過去 7 天）"""
+    try:
+        with _div_db_lock, sqlite3.connect(DIVERGENCE_DB) as con:
+            cur = con.execute("""SELECT sid,name,date,daily_div,weekly_div,close
+                FROM divergence_history ORDER BY date DESC, daily_div DESC""")
+            rows = [{"sid":x[0],"name":x[1],"date":x[2],"daily_div":x[3],
+                     "weekly_div":x[4],"close":x[5]} for x in cur.fetchall()]
+        uniq = len({r["sid"] for r in rows})
+        return jsonify({"total_rows":len(rows),"unique_stocks":uniq,
+                        "min_div":DIV_DB_MIN,"days":DIV_DB_DAYS,"data":rows})
+    except Exception as e:
+        return jsonify({"error":str(e),"data":[]}), 500
+
+@app.route("/api/divergence_db/clear", methods=["POST","GET"])
+def api_divergence_db_clear():
+    try:
+        with _div_db_lock, sqlite3.connect(DIVERGENCE_DB) as con:
+            con.execute("DELETE FROM divergence_history")
+        return jsonify({"ok":True,"msg":"背離DB已清空"})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
 @app.route("/api/scan/condition_d", methods=["GET"])
 def api_scan_condition_d():
     """條件 D：日K背離分數≥5 + 週K背離分數≥2（三指標+日週雙重 / 日週強烈共振）
@@ -2049,6 +2147,29 @@ def api_scan_condition_d():
         except Exception:
             pass
 
+    # ── DB 擴充：過去7天背離≥5 + 今日UT買訊（不要求今日週背離）──
+    use_db = request.args.get("use_db","1") != "0"
+    db_added = 0
+    if use_db:
+        recent_div = get_recent_divergence()
+        hit_ids = {h.get("id") for h in hits}
+        for r in cached:
+            sid = r.get("id")
+            if sid in hit_ids: continue
+            if sid not in recent_div: continue
+            if not r.get("ut_buy"): continue
+            if r.get("volume",0) < 20: continue
+            if not _ind_ok(sid): continue
+            info = recent_div[sid]
+            r_out = {**r}
+            r_out["weekly_score"]     = 0
+            r_out["strong_resonance"] = False
+            r_out["double_resonance"] = False
+            r_out["db_delayed"]       = True
+            r_out["buy_mode"]         = "D"
+            r_out["buy_reasons"]      = [f"DB背離{info['div']}分@{info['last_date']}", "今日UT確認"]
+            hits.append(r_out); db_added += 1
+
     hits.sort(key=lambda x: (
         -int(x.get("strong_resonance", False)),
         -x.get("weekly_score", 0),
@@ -2057,7 +2178,7 @@ def api_scan_condition_d():
     ))
     push_scan_summary("D", hits)
     return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
-                              "mode":"D","candidates":len(candidates),
+                              "mode":"D","candidates":len(candidates),"db_added":db_added,
                               "strong_count":sum(1 for h in hits if h.get("strong_resonance")),
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
@@ -2436,6 +2557,7 @@ def startup_sequence():
     _load_delisted()
     load_full_stock_list()
     fetch_industry_map()
+    _init_div_db()
     warm_up_cache()
     _load_scan_cache_disk()        # ★ 載入上次掃描結果，第一次掃描即可走 fast mode
     _save_delisted()
