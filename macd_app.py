@@ -1172,7 +1172,9 @@ def analyze_stock(stock: dict) -> dict:
     if has_history:
         # 取出原始 Series（不額外 copy，後面只在需要時才寫入）
         closes  = hist["Close"]
-        volumes = hist["Volume"]
+        # yfinance 成交量是「股」，台股慣用「張」(1張=1000股)。即時報價(Shioaji/TWSE)
+        # 已是「張」，故在此把歷史量 ÷1000 統一為「張」，避免單位混用導致 vol_ratio 失真。
+        volumes = hist["Volume"] / 1000.0
         highs   = hist["High"]  if "High"  in hist.columns else closes
         lows_s  = hist["Low"]   if "Low"   in hist.columns else closes
         opens_s = hist["Open"]  if "Open"  in hist.columns else closes
