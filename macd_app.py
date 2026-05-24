@@ -2366,13 +2366,14 @@ def _e_priority(r):
 @app.route("/api/scan/condition_e", methods=["GET"])
 def api_scan_condition_e():
     """條件 E：日週 MACD 共振（順勢）
-    必要：週DIF>DEA(多頭) + 日MACD金叉 + 站上MA20 + 量比≥1.5
+    必要：週DIF>DEA(多頭) + 日MACD金叉 + 站上MA20 + 量比≥1.5 + 離MA20乖離≤max_bias%
     加分：週零軸上(強多)、週剛金叉、週紅柱放大、日金叉在零軸下(起漲)、日底背離、帶量紅K
     最後只回 E評分≥min_score。on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
     min_vol_ratio = float(request.args.get("min_vol_ratio", "1.5"))
     require_above_zero = request.args.get("require_above_zero", "0") != "0"
     min_score = int(request.args.get("min_score", "6"))
+    max_bias = float(request.args.get("max_bias", "12"))  # 離MA20乖離上限,超過視為追高直接濾掉
     with cache_lock: cached = list(cache.values())
     if not cached:
         return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"E"}), 400
@@ -2425,6 +2426,7 @@ def api_scan_condition_e():
         r_out["weekly_macd"]   = w
         r_out["e_score"]       = score
         prio, level_tag, bias = _e_priority(r_out)
+        if bias > max_bias: return None   # 乖離過大(追高)直接濾掉,不只是排後面
         r_out["prio"]          = prio
         r_out["level_tag"]     = level_tag
         r_out["bias20"]        = bias
