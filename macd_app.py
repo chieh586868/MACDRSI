@@ -2308,7 +2308,11 @@ def _get_weekly_williams_state(sid: str, ex: str = "tse") -> dict:
         if len(wdf) < 30:
             with _weekly_wr_lock: _weekly_wr_cache[sid] = (empty, now_ts)
             return empty
-        wr_res = calc_williams_signals_v4(wdf["Close"], wdf["High"], wdf["Low"])
+        # 週線專屬收緊參數：剛脫離 + 波峰≥4 + 深底窗口6-26週（避免普漲日假脫離）
+        wk_wave_params = {"window_min":6, "window_max":26, "min_peaks":4,
+                           "deep_low_thr":-85.0, "escape_thr":-50.0, "fresh_escape":True}
+        wr_res = calc_williams_signals_v4(wdf["Close"], wdf["High"], wdf["Low"],
+                                           wave_params=wk_wave_params)
         wi = wr_res.get("wave_info", {})
         state = {
             "wave_complete": bool(wi.get("wave_complete", False)),

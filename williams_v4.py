@@ -34,7 +34,8 @@ def detect_wave_complete(sl: np.ndarray,
                           window_min: int = 8,
                           window_max: int = 21,
                           min_peaks: int = 3,
-                          escape_thr: float = -50.0) -> dict:
+                          escape_thr: float = -50.0,
+                          fresh_escape: bool = False) -> dict:
     """
     回傳 dict：
       ok            : True 表示三段條件全滿足
@@ -43,6 +44,8 @@ def detect_wave_complete(sl: np.ndarray,
       peak_count    : 深底到今天的局部高點數
       wr_now        : 今天 WR
       wr_yest       : 昨天 WR
+    fresh_escape=True：要求「上一根仍 ≤ escape_thr、這一根才剛站上」（避免早就站上、
+      只是順勢再漲也被計為脫離）。週線版用，過濾普漲日的假脫離。
     """
     n = len(sl)
     out = {"ok": False, "deep_low_val": 0.0, "bars_from_low": 0,
@@ -58,6 +61,7 @@ def detect_wave_complete(sl: np.ndarray,
     # 段3 先檢查（最便宜）：今天必須脫離超賣且向上
     if wr_now <= escape_thr:        return out
     if wr_now <= wr_yest:           return out
+    if fresh_escape and wr_yest > escape_thr:  return out  # 上一根已站上 → 非「剛脫離」
 
     # 段1：在 [n-1-window_max, n-1-window_min] 區間找最低 WR
     lo_idx_start = max(0, n - 1 - window_max)
@@ -188,7 +192,10 @@ def calc_williams_signals_v4(closes: pd.Series,
                               highs:  pd.Series,
                               lows:   pd.Series,
                               ind:    dict = None,
-                              debug:  bool = False) -> dict:
+                              debug:  bool = False,
+                              wave_params: dict = None) -> dict:
+    """wave_params：可選，覆寫 detect_wave_complete 的參數（週線版傳收緊參數）。
+    預設 None → 沿用日線參數，日線/條件B 行為完全不變。"""
     if len(closes) < 30:
         return {"buy_signals": [], "wave_info": {}, "wr_now": -50.0, "wr_list": []}
 
@@ -205,7 +212,7 @@ def calc_williams_signals_v4(closes: pd.Series,
          else wr_clean.values.astype(float)
 
     # 嚴格波浪完成偵測（主要訊號）
-    wc = detect_wave_complete(sl)
+    wc = detect_wave_complete(sl, **(wave_params or {}))
 
     # 次要資訊（波浪結構供前端顯示用，不驅動買訊）
     wave_info = find_wr_waves_v4(wr, lookback=60, debug=debug)
