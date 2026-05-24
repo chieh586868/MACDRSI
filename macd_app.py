@@ -2847,10 +2847,11 @@ def _weekly_change_signal_counts(sid, ex, today_close):
     黑K(收<開)阻力=(開+收)/2；突破=收盤 > 阻力(嚴格大於)；『4或5』任一突破算 1 個。
     資料不足回 (None, None)。"""
     try:
-        df = fetch_history(sid, period="2y", ex=ex)   # 週線需 ~60+ 根日K
+        # 只回看到13週→需~15根週K≈75個交易日，抓6個月日K已足夠(不必2年)
+        df = fetch_history(sid, period="6mo", ex=ex)
     except Exception:
         return None, None
-    if df is None or len(df) < 60:
+    if df is None or len(df) < 75:
         return None, None
     try:
         df = df.copy()
