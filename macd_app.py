@@ -588,11 +588,11 @@ def _prev_scalar(s, default=0.0):
     except Exception:
         return default
 
-def _prev2_scalar(s, default=0.0):
-    """倒數第三個值（2 日前）"""
+def _recent3_high(s, default=0.0):
+    """近3日最高：2日前/3日前/4日前 三日最高（排除今日與昨日，避免與昨收比較失去意義）"""
     try:
-        v = s.values[-3]
-        return default if v != v else float(v)
+        vals = [float(v) for v in s.values[-5:-2] if v == v]
+        return max(vals) if vals else default
     except Exception:
         return default
 
@@ -1260,7 +1260,7 @@ def analyze_stock(stock: dict) -> dict:
         "ma20": _last_scalar(ind.get("ma20", pd.Series([0]))) if ind else 0,
         "ma60": _last_scalar(ind.get("ma60", pd.Series([0]))) if ind else 0,
         "prev_close": _prev_scalar(closes) if has_history else 0,
-        "prev2_high": _prev2_scalar(highs) if has_history else 0,
+        "prev3_high": _recent3_high(highs) if has_history else 0,
         "prev_ma5":   _prev_scalar(ind.get("ma5",  pd.Series([0]))) if ind else 0,
         "prev_ma10":  _prev_scalar(ind.get("ma10", pd.Series([0]))) if ind else 0,
         "dif":  _last_scalar(ind.get("dif",  pd.Series([0]))) if ind else 0,
@@ -1300,7 +1300,7 @@ def analyze_stock_fast(stock: dict):
     with cache_lock:
         cached = cache.get(sid)
 
-    if cached and cached.get("has_data") and rt and rt.get("close",0) > 0:
+    if cached and cached.get("has_data") and "prev3_high" in cached and rt and rt.get("close",0) > 0:
         close_now = rt["close"]
         yest = rt.get("yest", cached.get("yest", close_now))
         change = close_now - yest
@@ -1318,7 +1318,8 @@ def analyze_stock_fast(stock: dict):
     is_trading = (9*60 <= t_min <= 13*60+35) and (now.weekday() < 5)
     # 休市時直接用 cache（不重算）；但若是舊版 cache（缺 prev_close 欄位）或
     # vol_ratio 異常為 0（舊版休市抓報價 volume=0 算壞），則強制重算修正。
-    cache_is_fresh = (cached and "prev_close" in cached and cached.get("vol_ratio", 0) > 0)
+    cache_is_fresh = (cached and "prev_close" in cached and "prev3_high" in cached
+                      and cached.get("vol_ratio", 0) > 0)
     if cached and cached.get("has_data") and not is_trading and cache_is_fresh:
         updated = dict(cached)
         updated["scanned_at"] = datetime.now().strftime("%H:%M:%S")
@@ -2125,6 +2126,38 @@ def api_divergence_db_clear():
     except Exception as e:
         return jsonify({"error":str(e)}), 500
 
+
+def _dw_divergence(sid: str, ex: str = "tse"):
+    """條件 D 核心（嚴格）：日K背離分數≥5 且 週K背離分數≥2。回傳 (div_d, div_w) 或 None。
+    供條件 D 路由與條件 F 的聯集共用，結果一致。"""
+    try:
+        from divergence_screener import calc_ind as ds_calc_ind, calc_div_score as ds_calc_div_score
+    except Exception:
+        return None
+    try:
+        df = fetch_history(sid, period="1y", ex=ex)
+        if len(df) < 60: return None
+        closes  = df["Close"]; volumes = df["Volume"]
+        highs   = df["High"] if "High" in df.columns else closes
+        lows_s  = df["Low"]  if "Low"  in df.columns else closes
+        ind_d   = ds_calc_ind(closes, highs, lows_s, volumes)
+        div_d   = ds_calc_div_score(ind_d, closes, highs, lows_s, volumes, max_bars=15)
+        if div_d.get("score", 0) < 5: return None
+        df.index = pd.to_datetime(df.index)
+        wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
+                                          "Close":"last","Volume":"sum"}).dropna()
+        if len(wdf) < 12: return None
+        wc = wdf["Close"]; wv = wdf["Volume"]
+        wh = wdf["High"] if "High" in wdf.columns else wc
+        wl = wdf["Low"]  if "Low"  in wdf.columns else wc
+        ind_w = ds_calc_ind(wc, wh, wl, wv)
+        div_w = ds_calc_div_score(ind_w, wc, wh, wl, wv, max_bars=10)
+        if div_w.get("score", 0) < 2: return None
+        return div_d, div_w
+    except Exception:
+        return None
+
+
 @app.route("/api/scan/condition_d", methods=["GET"])
 def api_scan_condition_d():
     """條件 D：日K背離分數≥5 + 週K背離分數≥2（三指標+日週雙重 / 日週強烈共振）
@@ -2154,30 +2187,10 @@ def api_scan_condition_d():
     def analyze_dw(r):
         sid = r.get("id")
         ex = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
-        try:
-            df = fetch_history(sid, period="1y", ex=ex)
-            if len(df) < 60: return None
-            closes  = df["Close"]; volumes = df["Volume"]
-            highs   = df["High"] if "High" in df.columns else closes
-            lows_s  = df["Low"]  if "Low"  in df.columns else closes
-            ind_d   = ds_calc_ind(closes, highs, lows_s, volumes)
-            div_d   = ds_calc_div_score(ind_d, closes, highs, lows_s, volumes, max_bars=15)
-            if div_d.get("score", 0) < 5: return None
-
-            df.index = pd.to_datetime(df.index)
-            wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
-                                              "Close":"last","Volume":"sum"}).dropna()
-            if len(wdf) < 12: return None
-            wc = wdf["Close"]; wv = wdf["Volume"]
-            wh = wdf["High"] if "High" in wdf.columns else wc
-            wl = wdf["Low"]  if "Low"  in wdf.columns else wc
-            ind_w = ds_calc_ind(wc, wh, wl, wv)
-            div_w = ds_calc_div_score(ind_w, wc, wh, wl, wv, max_bars=10)
-            ws = div_w.get("score", 0)
-            if ws < 2: return None
-            return r, div_d, div_w
-        except Exception:
-            return None
+        res = _dw_divergence(sid, ex)
+        if not res: return None
+        div_d, div_w = res
+        return r, div_d, div_w
 
     hits = []
     futures = {_global_executor.submit(analyze_dw, r): r for r in candidates}
@@ -2545,10 +2558,10 @@ def api_scan_condition_e():
 
 
 def _f_pullback_ok(r):
-    """昨日回檔確認：1日前收盤<2日前最高 且 (1日前收盤≤1日前MA5 或 1日前收盤≤1日前MA10)。
-    意義：今天觸發買訊之前，昨天才剛從短均下方/前高下方回檔過 → 不追高。"""
+    """昨日回檔確認：1日前收盤<近3日最高 且 (1日前收盤≤1日前MA5 或 1日前收盤≤1日前MA10)。
+    近3日最高=2/3/4日前三日最高。意義：今天觸發買訊前，昨天才剛從近期高點/短均下方回檔 → 不追高。"""
     pc   = r.get("prev_close", 0)
-    ph   = r.get("prev2_high", 0)
+    ph   = r.get("prev3_high", 0)
     pm5  = r.get("prev_ma5", 0)
     pm10 = r.get("prev_ma10", 0)
     if pc <= 0 or ph <= 0:
@@ -2556,8 +2569,9 @@ def _f_pullback_ok(r):
     return pc < ph and ((pm5 > 0 and pc <= pm5) or (pm10 > 0 and pc <= pm10))
 
 
-def _f_union_abcde(r, e_ids):
-    """是否符合 A/B/C/D/E 任一。A/B/C/D 用 cache 即時判斷，E 用預先算好的命中集合。"""
+def _f_union_abcde(r, e_ids, d_ids):
+    """是否符合 A/B/C/D/E 任一。A/B/C 用 cache 即時判斷；D 用嚴格週背離命中集合；E 用 MACD共振命中集合。
+    回傳符合的條件標籤 list。"""
     has_fib = bool(r.get("fib",{}).get("buy_signals"))
     has_ut  = bool(r.get("ut_buy"))
     has_wr  = bool(r.get("wr",{}).get("buy_signals"))
@@ -2589,7 +2603,7 @@ def _f_union_abcde(r, e_ids):
     is_a = has_ut and has_wr and has_div and common
     is_b = has_ut and has_fib and fib_above_ma and common
     is_c = has_ut and has_fib and has_wr and (confirm_score>4) and common
-    is_d = has_div and (div.get("score",0)>=4 or div.get("regular_count",0)>=1) and not_falling
+    is_d = r.get("id") in d_ids   # 嚴格D：日K背離≥5 + 週K背離≥2
     is_e = r.get("id") in e_ids
     tags = []
     if is_a: tags.append("A")
@@ -2603,8 +2617,8 @@ def _f_union_abcde(r, e_ids):
 @app.route("/api/scan/condition_f", methods=["GET"])
 def api_scan_condition_f():
     """條件 F（嚴格）：週線威廉波浪完成 + 符合A/B/C/D/E任一 + 昨日回檔確認。
-    昨日回檔 = 1日前收盤<2日前最高 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
-    流程：cache 先用「昨日回檔 + A/B/C/D/E任一」過濾（便宜）→ 再 on-demand 抓週線威廉(F參數,嚴)。"""
+    昨日回檔 = 1日前收盤<近3日最高(2/3/4日前) 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
+    D 為嚴格版(日K背離≥5+週K背離≥2)。流程：先昨日回檔過濾 → 算D/E命中集合 → 聯集 → 週線威廉(F參數,嚴)。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
     with cache_lock: cached = list(cache.values())
     if not cached:
@@ -2614,20 +2628,39 @@ def api_scan_condition_f():
         if not exclude_traditional: return True
         return not is_excluded_industry(industry_map.get(sid, ""))
 
-    # E 命中集合一次算好（E 內含週MACD，7天cache）
+    # 先用最便宜的條件過濾：流動性 + 昨日回檔
+    pullback_pool = [r for r in cached
+                     if r.get("volume",0) >= 20 and _ind_ok(r.get("id",""))
+                     and _f_pullback_ok(r)]
+    if not pullback_pool:
+        return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"F",
+                                  "candidates":0,"scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+    # E 命中集合（E 內含週MACD，7天cache）
     try:
         e_hits, _ = scan_condition_e(cached, exclude_traditional=exclude_traditional)
         e_ids = {h.get("id") for h in e_hits}
     except Exception:
         e_ids = set()
 
-    # 便宜的前置過濾：流動性 + 昨日回檔 + 符合A/B/C/D/E任一
+    # 嚴格D命中集合（日K背離≥5+週K背離≥2）：只對 pullback_pool 中日背離≥2 的股抓週線，省流量
+    d_cand = [r for r in pullback_pool if (r.get("div") or {}).get("score",0) >= 2]
+    d_ids = set()
+    if d_cand:
+        dfuts = {_global_executor.submit(
+                    _dw_divergence, r.get("id"),
+                    next((s.get("ex","tse") for s in watchlist if s["id"]==r.get("id")), "tse")
+                 ): r.get("id") for r in d_cand}
+        for ft in as_completed(dfuts):
+            try:
+                if ft.result(timeout=30): d_ids.add(dfuts[ft])
+            except Exception: pass
+
+    # 聯集過濾：符合 A/B/C/D/E 任一
     candidates = []
     f_tags_by_id = {}
-    for r in cached:
-        if r.get("volume",0) < 20 or not _ind_ok(r.get("id","")): continue
-        if not _f_pullback_ok(r): continue
-        tags = _f_union_abcde(r, e_ids)
+    for r in pullback_pool:
+        tags = _f_union_abcde(r, e_ids, d_ids)
         if not tags: continue
         f_tags_by_id[r.get("id")] = tags
         candidates.append(r)
