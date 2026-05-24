@@ -3213,6 +3213,25 @@ def api_export_csv():
         return Response(csv_data, mimetype="text/csv",
             headers={"Content-Disposition": f"attachment; filename=scan_F_{ts}.csv"})
 
+    if mode == "G":
+        # 條件 G 專屬（盤中買點視角）：今日突破數(≥4=買點) + 1日前突破數(尚未起漲) + 進場群
+        w.writerow(["#","股號","名稱","現價","漲跌幅%","量比",
+                    "今日突破數","1日前突破數","買點⚡","進場群1","進場群2",
+                    "昨收","近3日高","昨MA5","昨MA10","MA20","MA60"])
+        for i, r in enumerate(rows, 1):
+            w.writerow([i, r.get("id",""), r.get("name",""),
+                        r.get("close",0), r.get("change_pct",0), r.get("vol_ratio",0),
+                        r.get("today_change_signals",""), r.get("prev_change_signals",""),
+                        "是" if r.get("buy_now") else "",
+                        r.get("g1_tag",""), "/".join(r.get("g2_tags", [])),
+                        r.get("prev_close",0), r.get("prev3_high",0),
+                        r.get("prev_ma5",0), r.get("prev_ma10",0),
+                        r.get("ma20",0), r.get("ma60",0)])
+        csv_data = buf.getvalue()
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        return Response(csv_data, mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=scan_G_{ts}.csv"})
+
     w.writerow(["#","股號","名稱","現價","漲跌","漲跌幅%","成交量(張)","量比",
                 "MA5","MA10","MA20","MA60","背離分數","週背離分數","來源","訊號"])
     for i, r in enumerate(rows, 1):
