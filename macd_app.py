@@ -2842,7 +2842,8 @@ def _change_signal_counts(sid, ex, today_close, prev_close):
 
 def scan_condition_g(cached, exclude_traditional=True):
     """條件 G 掃描核心，回傳 (hits, candidate_count)。供 API route 與自動排程共用。
-    1. (UT∨費波南)∧(日威廉∨指標背離∨MACD共振∨週威廉)，各訊號沿用 A~F 既有門檻。
+    1. (UT∨費波南) ∧ (日威廉∨指標背離∨MACD共振) ∧ 週威廉波浪完成(必要)，各訊號沿用 A~F 既有門檻。
+       （週威廉波浪用 F 嚴格波浪參數，從四選一升級為必要條件，命中更集中、數量更少。）
     2. 1日前回檔：1日前收盤<近3日最高 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
     3a.尚未起漲過濾：1日前收盤突破的變盤訊號 < 4（壓力K相對1日前往前1/2/3/(4或5)/8/13根）。
     3b.今日突破數：以今日即時收盤為突破者，比相對今日1/2/3/(4或5)/8/13根壓力，≥4=買點。"""
@@ -2874,16 +2875,15 @@ def scan_condition_g(cached, exclude_traditional=True):
         r, st = item
         sid = r.get("id")
         ex  = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
-        # 群2：日威廉 / 指標背離 / MACD共振 / 週威廉（前三項用 cache，皆不滿足才抓週威廉）
+        # 群2(三選一)：日威廉 / 指標背離 / MACD共振（皆用 cache）
         g2 = []
         if st["wr"]:     g2.append("日威廉")
         if st["div"]:    g2.append("指標背離")
         if sid in e_ids: g2.append("MACD共振")
-        wkw = None
-        if not g2:
-            wkw = _get_weekly_williams_state(sid, ex, preset="F")
-            if wkw.get("wave_complete"): g2.append("週威廉波浪")
         if not g2: return None
+        # 週威廉波浪：升級為必要條件（用 F 嚴格波浪參數），沒完成就淘汰
+        wkw = _get_weekly_williams_state(sid, ex, preset="F")
+        if not wkw.get("wave_complete"): return None
         # 第3點：1日前突破<4(尚未起漲) → 留下；今日突破數(盤中即時)→ 顯示，≥4=買點
         prev_n, today_n = _change_signal_counts(sid, ex, r.get("close", 0), r.get("prev_close", 0))
         if prev_n is None or prev_n >= 4: return None
@@ -2896,10 +2896,13 @@ def scan_condition_g(cached, exclude_traditional=True):
         r_out["buy_now"]              = today_n >= 4
         r_out["g1_tag"]               = g1
         r_out["g2_tags"]              = g2
-        if wkw: r_out["weekly_wr"] = wkw
+        r_out["weekly_wr"]            = wkw
         r_out["buy_reasons"]    = [
             f"進場群1：{g1}",
             f"進場群2：{'/'.join(g2)}",
+            f"週威廉波浪完成(深底WR{wkw.get('deep_low_val',0):.0f}，"
+            f"{wkw.get('bars_from_low',0)}週前，{wkw.get('peak_count',0)}個波峰，"
+            f"今週WR{wkw.get('wr_now',0):.0f})",
             "1日前回檔確認(昨收<近3日高且≤短均)",
             f"1日前突破 {prev_n} 個(<4，尚未起漲)",
             (f"今日已突破 {today_n} 個（≥4 買點⚡）" if r_out["buy_now"]
@@ -2924,8 +2927,8 @@ def scan_condition_g(cached, exclude_traditional=True):
 
 @app.route("/api/scan/condition_g", methods=["GET"])
 def api_scan_condition_g():
-    """條件 G（盤中選股）：(UT或費波南)∧(日威廉/背離/MACD共振/週威廉) + 1日前回檔 +
-    1日前尚未起漲(突破<4)，並回傳今日即時突破數(≥4=買點)。盤中即時價會變動，
+    """條件 G（盤中選股）：(UT或費波南)∧(日威廉/背離/MACD共振)∧週威廉波浪完成(必要) +
+    1日前回檔 + 1日前尚未起漲(突破<4)，並回傳今日即時突破數(≥4=買點)。盤中即時價會變動，
     所以今日突破數會隨盤勢更新。第一次慢、之後 7 天 cache。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
     with cache_lock: cached = list(cache.values())
