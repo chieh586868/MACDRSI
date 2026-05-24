@@ -2616,6 +2616,28 @@ def api_export_csv():
     buf = io.StringIO()
     buf.write("﻿")  # BOM for Excel UTF-8
     w = csv.writer(buf)
+    if mode == "E":
+        # 條件 E 專屬：顯示 E 評分、週 MACD 狀態、共振品質標記，方便分級
+        w.writerow(["#","股號","名稱","現價","漲跌","漲跌幅%","成交量(張)","量比",
+                    "MA5","MA10","MA20","MA60","E評分","週MACD狀態","日底背離","共振品質"])
+        for i, r in enumerate(rows, 1):
+            wk  = r.get("weekly_macd") or {}
+            div = r.get("div") or {}
+            weekly_txt = "零軸上" if wk.get("above_zero") else "零軸下"
+            if wk.get("golden_cross"): weekly_txt += "/剛金叉"
+            if wk.get("hist_rising"):  weekly_txt += "/紅柱放大"
+            base = {"日週MACD共振","週MACD多頭","日MACD金叉","站上MA20"}
+            flags = [x for x in (r.get("buy_reasons") or []) if x not in base]
+            w.writerow([i, r.get("id",""), r.get("name",""),
+                        r.get("close",0), r.get("change",0), r.get("change_pct",0),
+                        r.get("volume",0), r.get("vol_ratio",0),
+                        r.get("ma5",0), r.get("ma10",0), r.get("ma20",0), r.get("ma60",0),
+                        r.get("e_score",0), weekly_txt, div.get("score",0), " ".join(flags)])
+        csv_data = buf.getvalue()
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        return Response(csv_data, mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=scan_E_{ts}.csv"})
+
     w.writerow(["#","股號","名稱","現價","漲跌","漲跌幅%","成交量(張)","量比",
                 "MA5","MA10","MA20","MA60","背離分數","週背離分數","來源","訊號"])
     for i, r in enumerate(rows, 1):
