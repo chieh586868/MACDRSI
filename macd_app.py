@@ -2765,49 +2765,60 @@ def _g_signal_states(r):
             "wr":has_wr, "div":has_div}
 
 
-def _count_change_signals(sid, ex):
-    """條件 G 第3點：『1日前收盤價』突破了幾個變盤訊號壓力區，回傳個數(0~6)，資料不足回 None。
-    以 1日前(最近一根完整K) 為基準，壓力K取其前 1/2/3/(4或5)/8/13 根
-    （相對今日即 2/3/4/(5或6)/9/14 日前）。
-    壓力區：紅K(收≥開)=開盤價；黑K(收<開)=(開+收)/2。突破=1日前收盤 > 壓力區。
-    『4或5日前』(相對1日前)任一被突破即算 1 個（總共仍是 6 個變盤訊號）。"""
+def _change_signal_counts(sid, ex, today_close):
+    """回傳 (昨日突破數, 今日突破數)：以『1日前收盤』與『今日即時收盤』分別當突破者，
+    各突破了幾個變盤訊號壓力區(0~6)。資料不足回 (None, None)。
+    壓力區相對各自突破者往前取 1/2/3/(4或5)/8/13 根；
+    紅K(收≥開)壓力=開盤價、黑K(收<開)壓力=(開+收)/2；突破=收盤 > 壓力(嚴格大於)；
+    『4或5』任一被突破即算 1 個（各自最多 6 個）。
+    今日突破者用 today_close(盤中即時價)，所以盤中會隨價格變動。"""
     try:
         df = fetch_history(sid, ex=ex)
     except Exception:
-        return None
+        return None, None
     if df is None or len(df) < 14:
-        return None
+        return None, None
     closes = df["Close"].values.astype(float)
     opens  = (df["Open"] if "Open" in df.columns else df["Close"]).values.astype(float)
-    # base：1日前在序列尾端的位置。歷史最後一根若是今日 → 1日前=-2(base=2)，否則=-1(base=1)
+    # base：1日前在序列尾端的位置（歷史最後一根是今日 → 1日前=-2，否則=-1）
     try:
         base = 2 if pd.to_datetime(df.index[-1]).date() == date.today() else 1
     except Exception:
         base = 1
     if len(closes) < base + 13:
-        return None
-    breaker = closes[-base]
-    if breaker <= 0:
-        return None
-    def resistance(k):            # 相對 1日前往前 k 根（index -(base+k)）
-        o = opens[-(base + k)]; c = closes[-(base + k)]
-        return o if c >= o else (o + c) / 2.0
-    cnt = 0
-    for k in (1, 2, 3):
-        if breaker > resistance(k): cnt += 1
-    if (breaker > resistance(4)) or (breaker > resistance(5)): cnt += 1
-    for k in (8, 13):
-        if breaker > resistance(k): cnt += 1
-    return cnt
+        return None, None
+
+    def count(breaker, start_idx):
+        """start_idx：突破者『前一根』的負索引；壓力區第 k 根在 start_idx-(k-1)。"""
+        if breaker is None or breaker <= 0:
+            return None
+        def zone(k):
+            idx = start_idx - (k - 1)
+            o = opens[idx]; c = closes[idx]
+            return o if c >= o else (o + c) / 2.0
+        n = 0
+        for k in (1, 2, 3):
+            if breaker > zone(k): n += 1
+        if (breaker > zone(4)) or (breaker > zone(5)): n += 1
+        for k in (8, 13):
+            if breaker > zone(k): n += 1
+        return n
+
+    prev_idx    = -base                                  # 1日前 索引
+    prev_count  = count(closes[prev_idx], prev_idx - 1)  # 1日前：往前一根起算
+    today_count = count(today_close,      prev_idx)      # 今日：往前一根=1日前起算
+    return prev_count, today_count
 
 
 @app.route("/api/scan/condition_g", methods=["GET"])
 def api_scan_condition_g():
-    """條件 G：(UT或費波南) 且 (日威廉/背離/MACD共振/週威廉 任一) + 昨日回檔 + 變盤訊號<4。
+    """條件 G（盤中選股）：(UT或費波南)∧(日威廉/背離/MACD共振/週威廉) + 1日前回檔 +
+    1日前尚未起漲(突破<4)，並回傳今日即時突破數(≥4=買點)。
     1. (UT∨費波南)∧(日威廉∨指標背離∨MACD共振∨週威廉)，各訊號沿用 A~F 既有門檻。
     2. 1日前回檔：1日前收盤<近3日最高 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
-    3. 1日前收盤突破的變盤訊號 < 4 個（壓力K取相對1日前的1/2/3/(4或5)/8/13根，
-       即相對今日的2/3/4/(5或6)/9/14日前）。
+    3a.尚未起漲過濾：1日前收盤突破的變盤訊號 < 4（壓力K相對1日前往前1/2/3/(4或5)/8/13根）。
+    3b.今日突破數：以今日即時收盤為突破者，比相對今日1/2/3/(4或5)/8/13根壓力，≥4=買點。
+       盤中即時價會變動，所以今日突破數會隨盤勢更新。
     流程：先用 cache 過濾(流動性+回檔+群1+共用門檻) → 算 E 命中集合 →
     群2(cache不足才抓週威廉) → 變盤訊號(抓日線歷史)。第一次慢、之後 7 天 cache。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
@@ -2854,21 +2865,26 @@ def api_scan_condition_g():
             wkw = _get_weekly_williams_state(sid, ex, preset="F")
             if wkw.get("wave_complete"): g2.append("週威廉波浪")
         if not g2: return None
-        # 第3點：變盤訊號 < 4（以 1日前收盤價為突破者）
-        n_sig = _count_change_signals(sid, ex)
-        if n_sig is None or n_sig >= 4: return None
+        # 第3點：1日前突破<4(尚未起漲) → 留下；今日突破數(盤中即時)→ 顯示，≥4=買點
+        prev_n, today_n = _change_signal_counts(sid, ex, r.get("close", 0))
+        if prev_n is None or prev_n >= 4: return None
+        today_n = today_n if today_n is not None else 0
         g1 = "UT" if st["ut"] else "費波南"
         r_out = dict(r)
-        r_out["buy_mode"]       = "G"
-        r_out["change_signals"] = n_sig
-        r_out["g1_tag"]         = g1
-        r_out["g2_tags"]        = g2
+        r_out["buy_mode"]             = "G"
+        r_out["prev_change_signals"]  = prev_n
+        r_out["today_change_signals"] = today_n
+        r_out["buy_now"]              = today_n >= 4
+        r_out["g1_tag"]               = g1
+        r_out["g2_tags"]              = g2
         if wkw: r_out["weekly_wr"] = wkw
         r_out["buy_reasons"]    = [
             f"進場群1：{g1}",
             f"進場群2：{'/'.join(g2)}",
             "1日前回檔確認(昨收<近3日高且≤短均)",
-            f"變盤訊號 {n_sig} 個(<4，未追高)",
+            f"1日前突破 {prev_n} 個(<4，尚未起漲)",
+            (f"今日已突破 {today_n} 個（≥4 買點⚡）" if r_out["buy_now"]
+             else f"今日已突破 {today_n} 個（等衝到≥4）"),
         ]
         return r_out
 
@@ -2880,10 +2896,14 @@ def api_scan_condition_g():
             if res: hits.append(res)
         except Exception: pass
 
-    hits.sort(key=lambda x: (x.get("change_signals", 9), -x.get("change_pct", 0)))
+    # 排序：今日已達買點(≥4)優先 → 今日突破數多 → 漲幅
+    hits.sort(key=lambda x: (-int(x.get("buy_now", False)),
+                             -x.get("today_change_signals", 0),
+                             -x.get("change_pct", 0)))
     push_scan_summary("G", hits)
     return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
                               "mode":"G","candidates":len(pool),
+                              "buy_now_count":sum(1 for h in hits if h.get("buy_now")),
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
 

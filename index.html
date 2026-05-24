@@ -348,7 +348,9 @@ function scan(mode) {
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       const rows = data.data || [];
       const extra = (mode === 'D' && data.strong_count !== undefined)
-        ? `（強烈共振 ${data.strong_count} 支）` : '';
+        ? `（強烈共振 ${data.strong_count} 支）`
+        : (mode === 'G' && data.buy_now_count !== undefined)
+        ? `（今日買點⚡ ${data.buy_now_count} 支）` : '';
       setInfo(
         `✓ 條件 ${mode}：找到 ${rows.length} 支${extra} / 共掃描 ${data.total} 支，耗時 ${elapsed} 秒`,
         rows.length > 0 ? 'ok' : ''
@@ -388,7 +390,9 @@ function filter(mode) {
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       const rows = data.data || [];
       const extra = (mode === 'D' && data.strong_count !== undefined)
-        ? `（強烈共振 ${data.strong_count} 支）` : '';
+        ? `（強烈共振 ${data.strong_count} 支）`
+        : (mode === 'G' && data.buy_now_count !== undefined)
+        ? `（今日買點⚡ ${data.buy_now_count} 支）` : '';
       setInfo(
         `✓ 過濾 ${mode}：找到 ${rows.length} 支${extra} / 共 ${data.total} 支，耗時 ${elapsed} 秒`,
         rows.length > 0 ? 'ok' : ''
@@ -425,11 +429,22 @@ function render(rows) {
     const dbTag = r.db_delayed
       ? ` <span title="${(r.buy_reasons||[]).join(' / ')}" style="background:#facc15;color:#1e293b;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;vertical-align:middle">延遲確認</span>`
       : '';
-    const rowStyle = r.db_delayed ? ' style="background:rgba(250,204,21,0.08)"' : '';
+    // 條件 G：顯示今日/1日前變盤突破數，今日≥4 標記買點
+    let gTag = '';
+    if (r.today_change_signals !== undefined) {
+      const tn = r.today_change_signals, pn = r.prev_change_signals;
+      const buy = r.buy_now;
+      const bg = buy ? '#16a34a' : '#475569';
+      const lbl = buy ? `買點⚡ 今${tn}` : `今${tn}/昨${pn}`;
+      gTag = ` <span title="${(r.buy_reasons||[]).join(' / ')}" style="background:${bg};color:#fff;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;vertical-align:middle">${lbl}</span>`;
+    }
+    const rowStyle = r.buy_now
+      ? ' style="background:rgba(22,163,74,0.12)"'
+      : (r.db_delayed ? ' style="background:rgba(250,204,21,0.08)"' : '');
     return `<tr${rowStyle}>
       <td>${i+1}</td>
       <td class="sid">${r.id}</td>
-      <td class="sname">${r.name || ''}${dbTag}</td>
+      <td class="sname">${r.name || ''}${dbTag}${gTag}</td>
       <td class="r price">${(r.close||0).toFixed(2)}</td>
       <td class="r ${cls}">${arrow} ${Math.abs(chg).toFixed(2)}</td>
       <td class="r ${cls}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
