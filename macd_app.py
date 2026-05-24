@@ -1715,6 +1715,7 @@ def push_scan_summary(mode: str, rows: list, max_show: int = 15):
 # ▌ 定時排程
 # ══════════════════════════════════════════════════════════
 scheduler_running = False; scheduler_interval = 30; last_notified = {}
+last_notified_g = {}   # 條件G盤中買點去重：sid -> 上次推播時間
 
 def is_market_hour():
     now = datetime.now()
@@ -1772,6 +1773,33 @@ def auto_scan_job():
             push_scan_summary("E", e_hits)
     except Exception as e:
         print(f"  ⚠ 自動 E 掃描失敗: {e}")
+
+    # ── 條件 G：盤中買點（今日突破數≥4），用剛掃完的 cache 跑，買點出現才推 Telegram ──
+    try:
+        with cache_lock: cached_g = list(cache.values())
+        g_hits, _ = scan_condition_g(cached_g)
+        # 只推「新」買點（同股 30 分鐘內不重複，避免每輪洗版）
+        fresh = []
+        for h in g_hits:
+            if not h.get("buy_now"): continue
+            sid = h.get("id")
+            lt = last_notified_g.get(sid)
+            if lt and (datetime.now()-lt).seconds < 1800: continue
+            last_notified_g[sid] = datetime.now()
+            fresh.append(h)
+        if fresh:
+            lines = [f"📈 <b>條件 G 盤中買點⚡</b>",
+                     f"🕐 {datetime.now().strftime('%H:%M:%S')}  {len(fresh)} 支今日突破≥4", ""]
+            for h in fresh[:10]:
+                c = h.get("change_pct", 0)
+                lines.append(f"★ <b>{h.get('name','')}({h.get('id','')})</b> "
+                             f"${h.get('close',0):.1f} {'▲' if c>0 else '▼'}{abs(c):.2f}% "
+                             f"今{h.get('today_change_signals',0)}/昨{h.get('prev_change_signals',0)} "
+                             f"[{h.get('g1_tag','')}+{'/'.join(h.get('g2_tags',[]))}]")
+            lines.append("\n⚠ 僅供參考")
+            send_telegram("\n".join(lines))
+    except Exception as e:
+        print(f"  ⚠ 自動 G 掃描失敗: {e}")
 
 def scheduler_loop():
     global scheduler_running
@@ -2810,22 +2838,12 @@ def _change_signal_counts(sid, ex, today_close):
     return prev_count, today_count
 
 
-@app.route("/api/scan/condition_g", methods=["GET"])
-def api_scan_condition_g():
-    """條件 G（盤中選股）：(UT或費波南)∧(日威廉/背離/MACD共振/週威廉) + 1日前回檔 +
-    1日前尚未起漲(突破<4)，並回傳今日即時突破數(≥4=買點)。
+def scan_condition_g(cached, exclude_traditional=True):
+    """條件 G 掃描核心，回傳 (hits, candidate_count)。供 API route 與自動排程共用。
     1. (UT∨費波南)∧(日威廉∨指標背離∨MACD共振∨週威廉)，各訊號沿用 A~F 既有門檻。
     2. 1日前回檔：1日前收盤<近3日最高 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
     3a.尚未起漲過濾：1日前收盤突破的變盤訊號 < 4（壓力K相對1日前往前1/2/3/(4或5)/8/13根）。
-    3b.今日突破數：以今日即時收盤為突破者，比相對今日1/2/3/(4或5)/8/13根壓力，≥4=買點。
-       盤中即時價會變動，所以今日突破數會隨盤勢更新。
-    流程：先用 cache 過濾(流動性+回檔+群1+共用門檻) → 算 E 命中集合 →
-    群2(cache不足才抓週威廉) → 變盤訊號(抓日線歷史)。第一次慢、之後 7 天 cache。"""
-    exclude_traditional = request.args.get("exclude_traditional","1") != "0"
-    with cache_lock: cached = list(cache.values())
-    if not cached:
-        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"G"}), 400
-
+    3b.今日突破數：以今日即時收盤為突破者，比相對今日1/2/3/(4或5)/8/13根壓力，≥4=買點。"""
     def _ind_ok(sid):
         if not exclude_traditional: return True
         return not is_excluded_industry(industry_map.get(sid, ""))
@@ -2841,8 +2859,7 @@ def api_scan_condition_g():
         if not (st["ut"] or st["fib"]): continue
         pool.append((r, st))
     if not pool:
-        return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"G",
-                                  "candidates":0,"scanned_at":datetime.now().strftime("%H:%M:%S")}))
+        return [], 0
 
     # MACD共振(E)命中集合（群2 來源之一；E 內含週MACD，7天cache）
     try:
@@ -2900,9 +2917,23 @@ def api_scan_condition_g():
     hits.sort(key=lambda x: (-int(x.get("buy_now", False)),
                              -x.get("today_change_signals", 0),
                              -x.get("change_pct", 0)))
+    return hits, len(pool)
+
+
+@app.route("/api/scan/condition_g", methods=["GET"])
+def api_scan_condition_g():
+    """條件 G（盤中選股）：(UT或費波南)∧(日威廉/背離/MACD共振/週威廉) + 1日前回檔 +
+    1日前尚未起漲(突破<4)，並回傳今日即時突破數(≥4=買點)。盤中即時價會變動，
+    所以今日突破數會隨盤勢更新。第一次慢、之後 7 天 cache。"""
+    exclude_traditional = request.args.get("exclude_traditional","1") != "0"
+    with cache_lock: cached = list(cache.values())
+    if not cached:
+        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"G"}), 400
+
+    hits, n_cand = scan_condition_g(cached, exclude_traditional)
     push_scan_summary("G", hits)
     return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
-                              "mode":"G","candidates":len(pool),
+                              "mode":"G","candidates":n_cand,
                               "buy_now_count":sum(1 for h in hits if h.get("buy_now")),
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
