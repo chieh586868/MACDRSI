@@ -429,13 +429,13 @@ function render(rows) {
     const dbTag = r.db_delayed
       ? ` <span title="${(r.buy_reasons||[]).join(' / ')}" style="background:#facc15;color:#1e293b;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;vertical-align:middle">延遲確認</span>`
       : '';
-    // 條件 G：顯示今日/1日前變盤突破數，今日≥4 標記買點
+    // 條件 G：顯示今日變盤/週變盤突破數，今日≥4 標記買點
     let gTag = '';
     if (r.today_change_signals !== undefined) {
-      const tn = r.today_change_signals, pn = r.prev_change_signals;
+      const tn = r.today_change_signals, wk = r.week_change_signals;
       const buy = r.buy_now;
       const bg = buy ? '#16a34a' : '#475569';
-      const lbl = buy ? `買點⚡ 今${tn}` : `今${tn}/昨${pn}`;
+      const lbl = (buy ? `買點⚡ 今${tn}` : `今${tn}`) + `/周${wk}`;
       gTag = ` <span title="${(r.buy_reasons||[]).join(' / ')}" style="background:${bg};color:#fff;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;vertical-align:middle">${lbl}</span>`;
     }
     const rowStyle = r.buy_now
