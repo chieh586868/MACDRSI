@@ -2332,33 +2332,33 @@ def api_scan_condition_c_strict():
 
 def _e_priority(r):
     """進場優先分(0-100)：把看線型會檢查的東西量化，解決一次20檔無法逐一看圖的問題。
-    四大支柱各 25 分：訊號強度 / 趨勢結構(均線多頭排列) / 進場位階(乖離率,追高扣分) / 多重確認+量能。
+    權重偏向「不追高」：進場位階40 / 訊號強度20 / 趨勢結構20 / 多重確認+量能20。
     回傳 (優先分, 位階標籤, 離MA20乖離%)。"""
     e_score = r.get("e_score", 0)
     close = r.get("close",0); ma5=r.get("ma5",0); ma10=r.get("ma10",0)
     ma20=r.get("ma20",0); ma60=r.get("ma60",0)
-    # 1. 訊號強度 (0-25)：日週共振+背離越強越高
-    p_sig = e_score / 9.0 * 25
-    # 2. 趨勢結構 (0-25)：均線多頭排列越完整越好
-    if   ma5>ma10>ma20>ma60>0: p_struct = 25
-    elif close>ma20>ma60>0:    p_struct = 15
-    elif close>ma20>0:         p_struct = 8
+    # 1. 訊號強度 (0-20)：日週共振+背離越強越高
+    p_sig = e_score / 9.0 * 20
+    # 2. 趨勢結構 (0-20)：均線多頭排列越完整越好
+    if   ma5>ma10>ma20>ma60>0: p_struct = 20
+    elif close>ma20>ma60>0:    p_struct = 12
+    elif close>ma20>0:         p_struct = 6
     else:                      p_struct = 0
-    # 3. 進場位階 (0-25)：離 MA20 乖離率，越貼近月線越好，追高扣分
+    # 3. 進場位階 (0-40, 主導)：離 MA20 乖離率，越貼近月線越好，追高大幅扣分
     bias = ((close-ma20)/ma20*100) if ma20>0 else 99
-    if   bias <= 5:  p_level, level_tag = 25, "剛突破✓"
-    elif bias <= 8:  p_level, level_tag = 20, "小幅乖離"
-    elif bias <= 12: p_level, level_tag = 13, "乖離中等"
-    elif bias <= 18: p_level, level_tag = 6,  "乖離偏大"
+    if   bias <= 4:  p_level, level_tag = 40, "剛突破✓"
+    elif bias <= 7:  p_level, level_tag = 32, "小幅乖離"
+    elif bias <= 10: p_level, level_tag = 22, "乖離中等"
+    elif bias <= 15: p_level, level_tag = 10, "乖離偏大"
     else:            p_level, level_tag = 2,  "追高⚠"
-    # 4. 多重確認 + 量能 (0-25)
+    # 4. 多重確認 + 量能 (0-20)
     p_conf = 0
-    if r.get("ut_buy"):                          p_conf += 8
-    if (r.get("fib") or {}).get("buy_signals"):  p_conf += 5
-    if (r.get("wr")  or {}).get("buy_signals"):  p_conf += 5
+    if r.get("ut_buy"):                          p_conf += 6
+    if (r.get("fib") or {}).get("buy_signals"):  p_conf += 4
+    if (r.get("wr")  or {}).get("buy_signals"):  p_conf += 4
     vr = r.get("vol_ratio", 0)
-    p_conf += 7 if vr >= 2 else (4 if vr >= 1.5 else 0)
-    p_conf = min(p_conf, 25)
+    p_conf += 6 if vr >= 2 else (3 if vr >= 1.5 else 0)
+    p_conf = min(p_conf, 20)
     prio = round(p_sig + p_struct + p_level + p_conf)
     return prio, level_tag, round(bias, 1)
 
