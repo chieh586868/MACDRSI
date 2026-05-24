@@ -1257,6 +1257,9 @@ def analyze_stock(stock: dict) -> dict:
         "dif":  _last_scalar(ind.get("dif",  pd.Series([0]))) if ind else 0,
         "dea":  _last_scalar(ind.get("dea",  pd.Series([0]))) if ind else 0,
         "hist": _last_scalar(ind.get("hist", pd.Series([0]))) if ind else 0,
+        "prev_dif":  _prev_scalar(ind.get("dif",  pd.Series([0]))) if ind else 0,
+        "prev_dea":  _prev_scalar(ind.get("dea",  pd.Series([0]))) if ind else 0,
+        "prev_hist": _prev_scalar(ind.get("hist", pd.Series([0]))) if ind else 0,
         "signals":      signals, "confirm": confirm,
         "ut_buy":  ut_buy_now,  "ut_sell": ut_sell_now,
         "ut_trend":ut_trend_now,"ut_trail":ut_trail_now,
@@ -2195,33 +2198,49 @@ _WEEKLY_CACHE_TTL  = 7 * 24 * 3600  # 7 天
 
 def _check_weekly_macd_bull(sid: str, ex: str = "tse") -> bool:
     """回傳該股票週 MACD 是否多頭（DIF > DEA）。7 天內共用快取。"""
+    return _get_weekly_macd_state(sid, ex).get("bull", False)
+
+def _get_weekly_macd_state(sid: str, ex: str = "tse") -> dict:
+    """回傳週 MACD 完整狀態：bull/golden_cross/above_zero/hist_rising/dif/dea/hist。
+    7 天內共用快取（週線一週才變一次）。"""
     now_ts = time.time()
     with _weekly_macd_lock:
         entry = _weekly_macd_cache.get(sid)
-        if entry and (now_ts - entry[1]) < _WEEKLY_CACHE_TTL:
+        if entry and (now_ts - entry[1]) < _WEEKLY_CACHE_TTL and isinstance(entry[0], dict):
             return entry[0]
+    empty = {"bull":False,"golden_cross":False,"above_zero":False,"hist_rising":False,
+             "dif":0.0,"dea":0.0,"hist":0.0}
     try:
         df = fetch_history(sid, period="1y", ex=ex)
         if len(df) < 60:
-            with _weekly_macd_lock: _weekly_macd_cache[sid] = (False, now_ts)
-            return False
+            with _weekly_macd_lock: _weekly_macd_cache[sid] = (empty, now_ts)
+            return empty
         df.index = pd.to_datetime(df.index)
         wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
                                           "Close":"last","Volume":"sum"}).dropna()
         if len(wdf) < 30:
-            with _weekly_macd_lock: _weekly_macd_cache[sid] = (False, now_ts)
-            return False
+            with _weekly_macd_lock: _weekly_macd_cache[sid] = (empty, now_ts)
+            return empty
         wc = wdf["Close"].values.astype(float)
         ema12 = pd.Series(wc).ewm(span=12, adjust=False).mean().values
         ema26 = pd.Series(wc).ewm(span=26, adjust=False).mean().values
         dif   = ema12 - ema26
         dea   = pd.Series(dif).ewm(span=9, adjust=False).mean().values
-        bull  = bool(dif[-1] > dea[-1])
-        with _weekly_macd_lock: _weekly_macd_cache[sid] = (bull, now_ts)
-        return bull
+        hist  = (dif - dea) * 2
+        state = {
+            "bull":         bool(dif[-1] > dea[-1]),
+            "golden_cross": bool(dif[-2] <= dea[-2] and dif[-1] > dea[-1]),
+            "above_zero":   bool(dif[-1] > 0 and dea[-1] > 0),
+            "hist_rising":  bool(hist[-1] > hist[-2]),
+            "dif":  round(float(dif[-1]), 4),
+            "dea":  round(float(dea[-1]), 4),
+            "hist": round(float(hist[-1]), 4),
+        }
+        with _weekly_macd_lock: _weekly_macd_cache[sid] = (state, now_ts)
+        return state
     except Exception:
-        with _weekly_macd_lock: _weekly_macd_cache[sid] = False
-        return False
+        with _weekly_macd_lock: _weekly_macd_cache[sid] = (empty, now_ts)
+        return empty
 
 
 @app.route("/api/scan/condition_c_strict", methods=["GET"])
@@ -2293,6 +2312,80 @@ def api_scan_condition_c_strict():
     push_scan_summary("C+", hits)
     return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
                               "mode":"C+","candidates":len(candidates),
+                              "scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+
+@app.route("/api/scan/condition_e", methods=["GET"])
+def api_scan_condition_e():
+    """條件 E：日週 MACD 共振（趨勢順勢）
+    必要：週MACD多頭 + 日MACD金叉 + 現價站上MA20
+    加分：週紅柱放大、週零軸上、日金叉在零軸下(起漲)、日底背離、帶量紅K
+    on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
+    exclude_traditional = request.args.get("exclude_traditional","1") != "0"
+    with cache_lock: cached = list(cache.values())
+    if not cached:
+        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"E"}), 400
+
+    def _ind_ok(sid):
+        if not exclude_traditional: return True
+        return not is_excluded_industry(industry_map.get(sid, ""))
+
+    # 先用 cache 篩日線金叉 + 站上MA20（快，免抓週線）
+    candidates = []
+    for r in cached:
+        if r.get("volume", 0) < 20: continue
+        if not _ind_ok(r.get("id","")): continue
+        close = r.get("close", 0); ma20 = r.get("ma20", 0)
+        dif = r.get("dif", 0); dea = r.get("dea", 0)
+        prev_dif = r.get("prev_dif", 0); prev_dea = r.get("prev_dea", 0)
+        # 日線 MACD 金叉：昨日 DIF≤DEA、今日 DIF>DEA
+        daily_golden = (prev_dif <= prev_dea) and (dif > dea)
+        # 現價站上 MA20（避免假訊號）
+        above_ma20 = close > 0 and ma20 > 0 and close >= ma20
+        if daily_golden and above_ma20:
+            candidates.append(r)
+
+    if not candidates:
+        return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"E",
+                                  "candidates":0,"scanned_at":datetime.now().strftime("%H:%M:%S")}))
+
+    # 對候選 on-demand 檢查週 MACD 多頭
+    def check(r):
+        sid = r.get("id")
+        ex = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
+        w = _get_weekly_macd_state(sid, ex)
+        if not w.get("bull"): return None
+        r_out = dict(r)
+        dif = r.get("dif",0); dea = r.get("dea",0)
+        div_score = (r.get("div") or {}).get("score", 0)
+        # 品質加分
+        flags = []
+        score = 0
+        if w.get("above_zero"):   score += 2; flags.append("週零軸上(強多)")
+        if w.get("golden_cross"): score += 2; flags.append("週剛金叉")
+        if w.get("hist_rising"):  score += 1; flags.append("週紅柱放大")
+        if dif < 0:               score += 1; flags.append("日金叉在零軸下(起漲)")
+        if div_score >= 2:        score += 2; flags.append(f"日底背離{div_score}")
+        if r.get("vol_ratio",0) >= 1.0 and r.get("change_pct",0) > 0:
+            score += 1; flags.append("帶量紅K")
+        r_out["weekly_macd"]   = w
+        r_out["e_score"]       = score
+        r_out["buy_mode"]      = "E"
+        r_out["buy_reasons"]   = ["日週MACD共振", "週MACD多頭", "日MACD金叉", "站上MA20"] + flags
+        return r_out
+
+    hits = []
+    futures = {_global_executor.submit(check, r): r for r in candidates}
+    for f in as_completed(futures):
+        try:
+            res = f.result(timeout=20)
+            if res: hits.append(res)
+        except Exception: pass
+
+    hits.sort(key=lambda x: (-x.get("e_score",0), -x.get("change_pct",0)))
+    push_scan_summary("E", hits)
+    return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
+                              "mode":"E","candidates":len(candidates),
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
 

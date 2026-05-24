@@ -42,10 +42,12 @@ body {
 .btn-b { background: linear-gradient(135deg, #dc2626, #ef4444); }
 .btn-c { background: linear-gradient(135deg, #7c3aed, #a855f7); }
 .btn-d { background: linear-gradient(135deg, #0891b2, #06b6d4); }
+.btn-e { background: linear-gradient(135deg, #15803d, #22c55e); }
 .btn-a:hover { background: linear-gradient(135deg, #b45309, #d97706); }
 .btn-b:hover { background: linear-gradient(135deg, #b91c1c, #dc2626); }
 .btn-c:hover { background: linear-gradient(135deg, #6d28d9, #7c3aed); }
 .btn-d:hover { background: linear-gradient(135deg, #0e7490, #0891b2); }
+.btn-e:hover { background: linear-gradient(135deg, #166534, #16a34a); }
 
 /* 過濾按鈕（不重新掃描，只用已掃描結果） */
 .btn-filter {
@@ -150,6 +152,7 @@ tr:hover { background: #161b22; }
     <button class="btn btn-b" onclick="scan('B')">條件 B</button>
     <button class="btn btn-c" onclick="scan('C')">條件 C</button>
     <button class="btn btn-d" onclick="scan('D')">背離 D</button>
+    <button class="btn btn-e" onclick="scan('E')">MACD共振 E</button>
   </div>
 
   <!-- 排程器 -->
@@ -180,6 +183,7 @@ tr:hover { background: #161b22; }
   <button class="btn btn-mini btn-filter" onclick="filter('B')">B</button>
   <button class="btn btn-mini btn-filter" onclick="filter('C')">C</button>
   <button class="btn btn-mini btn-filter" onclick="filter('D')">D</button>
+  <button class="btn btn-mini btn-filter" onclick="filter('E')">E</button>
   <label style="margin-left:14px;color:#cbd5e1;font-size:13px;cursor:pointer">
     <input type="checkbox" id="excl-trad" checked style="vertical-align:middle">
     排除冷門產業
@@ -319,9 +323,11 @@ function scan(mode) {
   fetch('/api/scan')
     .then(r => r.json())
     .then(() => {
-      // D 走背離端點，其餘走 buysignal
+      // D 走背離端點，E 走 MACD 共振端點，其餘走 buysignal
       const url = (mode === 'D')
         ? `/api/scan/condition_d?exclude_traditional=${exclTrad}`
+        : (mode === 'E')
+        ? `/api/scan/condition_e?exclude_traditional=${exclTrad}`
         : `/api/scan/buysignal?mode=${mode}&exclude_traditional=${exclTrad}`;
       return fetch(url);
     })
@@ -344,18 +350,21 @@ function scan(mode) {
 }
 
 function setBtns(disabled) {
-  document.querySelectorAll('.btn-a, .btn-b, .btn-c, .btn-d, .btn-filter').forEach(b => b.disabled = disabled);
+  document.querySelectorAll('.btn-a, .btn-b, .btn-c, .btn-d, .btn-e, .btn-filter').forEach(b => b.disabled = disabled);
 }
 
 // 只用已掃描結果再過濾，不重新跑 /api/scan
 function filter(mode) {
   currentMode = mode;
   setBtns(true);
-  setInfo(`過濾條件 ${mode} 中...${mode==='D'?'（D 需重抓1年資料，~10-30秒）':''}`, '');
+  const slow = (mode === 'D' || mode === 'E');
+  setInfo(`過濾條件 ${mode} 中...${slow?'（需重抓週線資料，~10-30秒）':''}`, '');
   const t0 = Date.now();
   const exclTrad = document.getElementById('excl-trad').checked ? '1' : '0';
   const url = (mode === 'D')
     ? `/api/scan/condition_d?exclude_traditional=${exclTrad}`
+    : (mode === 'E')
+    ? `/api/scan/condition_e?exclude_traditional=${exclTrad}`
     : `/api/scan/buysignal?mode=${mode}&exclude_traditional=${exclTrad}`;
   fetch(url)
     .then(r => r.json())
