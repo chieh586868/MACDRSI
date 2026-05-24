@@ -1725,6 +1725,15 @@ def auto_scan_job():
         lines.append("⚠ 僅供參考")
         send_telegram("\n".join(lines))
 
+    # ── 條件 E：日週 MACD 共振（順勢），用剛掃完的 cache 跑，推 Telegram ──
+    try:
+        with cache_lock: cached_e = list(cache.values())
+        e_hits, _ = scan_condition_e(cached_e)
+        if e_hits:
+            push_scan_summary("E", e_hits)
+    except Exception as e:
+        print(f"  ⚠ 自動 E 掃描失敗: {e}")
+
 def scheduler_loop():
     global scheduler_running
     while scheduler_running:
@@ -2363,21 +2372,9 @@ def _e_priority(r):
     return prio, level_tag, round(bias, 1)
 
 
-@app.route("/api/scan/condition_e", methods=["GET"])
-def api_scan_condition_e():
-    """條件 E：日週 MACD 共振（順勢）
-    必要：週DIF>DEA(多頭) + 日MACD金叉 + 站上MA20 + 量比≥1.5 + 離MA20乖離≤max_bias%
-    加分：週零軸上(強多)、週剛金叉、週紅柱放大、日金叉在零軸下(起漲)、日底背離、帶量紅K
-    最後只回 E評分≥min_score。on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
-    exclude_traditional = request.args.get("exclude_traditional","1") != "0"
-    min_vol_ratio = float(request.args.get("min_vol_ratio", "1.5"))
-    require_above_zero = request.args.get("require_above_zero", "0") != "0"
-    min_score = int(request.args.get("min_score", "6"))
-    max_bias = float(request.args.get("max_bias", "12"))  # 離MA20乖離上限,超過視為追高直接濾掉
-    with cache_lock: cached = list(cache.values())
-    if not cached:
-        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"E"}), 400
-
+def scan_condition_e(cached, exclude_traditional=True, min_vol_ratio=1.5,
+                      require_above_zero=False, min_score=6, max_bias=12.0):
+    """條件 E 掃描核心，回傳 (hits, candidate_count)。供 API route 與自動排程共用。"""
     def _ind_ok(sid):
         if not exclude_traditional: return True
         return not is_excluded_industry(industry_map.get(sid, ""))
@@ -2399,10 +2396,9 @@ def api_scan_condition_e():
             candidates.append(r)
 
     if not candidates:
-        return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"E",
-                                  "candidates":0,"scanned_at":datetime.now().strftime("%H:%M:%S")}))
+        return [], 0
 
-    # 對候選 on-demand 檢查週 MACD：須零軸上(強多)
+    # 對候選 on-demand 檢查週 MACD：須多頭(可選零軸上)
     def check(r):
         sid = r.get("id")
         ex = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
@@ -2443,9 +2439,29 @@ def api_scan_condition_e():
         except Exception: pass
 
     hits.sort(key=lambda x: (-x.get("prio",0), -x.get("e_score",0), -x.get("change_pct",0)))
+    return hits, len(candidates)
+
+
+@app.route("/api/scan/condition_e", methods=["GET"])
+def api_scan_condition_e():
+    """條件 E：日週 MACD 共振（順勢）
+    必要：週DIF>DEA(多頭) + 日MACD金叉 + 站上MA20 + 量比≥1.5 + 離MA20乖離≤max_bias%
+    加分：週零軸上(強多)、週剛金叉、週紅柱放大、日金叉在零軸下(起漲)、日底背離、帶量紅K
+    最後只回 E評分≥min_score。on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
+    exclude_traditional = request.args.get("exclude_traditional","1") != "0"
+    min_vol_ratio = float(request.args.get("min_vol_ratio", "1.5"))
+    require_above_zero = request.args.get("require_above_zero", "0") != "0"
+    min_score = int(request.args.get("min_score", "6"))
+    max_bias = float(request.args.get("max_bias", "12"))  # 離MA20乖離上限,超過視為追高直接濾掉
+    with cache_lock: cached = list(cache.values())
+    if not cached:
+        return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"E"}), 400
+
+    hits, n_cand = scan_condition_e(cached, exclude_traditional, min_vol_ratio,
+                                     require_above_zero, min_score, max_bias)
     push_scan_summary("E", hits)
     return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
-                              "mode":"E","candidates":len(candidates),
+                              "mode":"E","candidates":n_cand,
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
 
