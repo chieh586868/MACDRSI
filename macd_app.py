@@ -2317,11 +2317,14 @@ def api_scan_condition_c_strict():
 
 @app.route("/api/scan/condition_e", methods=["GET"])
 def api_scan_condition_e():
-    """條件 E：日週 MACD 共振（趨勢順勢）
-    必要：週MACD多頭 + 日MACD金叉 + 現價站上MA20
-    加分：週紅柱放大、週零軸上、日金叉在零軸下(起漲)、日底背離、帶量紅K
-    on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
+    """條件 E：日週 MACD 共振（強勢多頭順勢）
+    必要：週MACD零軸上(強多) + 週DIF>DEA + 日MACD金叉 + 站上MA20 + 量比≥1.5
+    加分：週剛金叉、週紅柱放大、日金叉在零軸下(起漲)、日底背離、帶量紅K
+    最後只回 E評分≥min_score。on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
+    min_vol_ratio = float(request.args.get("min_vol_ratio", "1.5"))
+    require_above_zero = request.args.get("require_above_zero", "1") != "0"
+    min_score = int(request.args.get("min_score", "6"))
     with cache_lock: cached = list(cache.values())
     if not cached:
         return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"E"}), 400
@@ -2330,10 +2333,11 @@ def api_scan_condition_e():
         if not exclude_traditional: return True
         return not is_excluded_industry(industry_map.get(sid, ""))
 
-    # 先用 cache 篩日線金叉 + 站上MA20（快，免抓週線）
+    # 先用 cache 篩日線金叉 + 站上MA20 + 量比（快，免抓週線）
     candidates = []
     for r in cached:
         if r.get("volume", 0) < 20: continue
+        if r.get("vol_ratio", 0) < min_vol_ratio: continue
         if not _ind_ok(r.get("id","")): continue
         close = r.get("close", 0); ma20 = r.get("ma20", 0)
         dif = r.get("dif", 0); dea = r.get("dea", 0)
@@ -2349,12 +2353,13 @@ def api_scan_condition_e():
         return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"E",
                                   "candidates":0,"scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
-    # 對候選 on-demand 檢查週 MACD 多頭
+    # 對候選 on-demand 檢查週 MACD：須零軸上(強多)
     def check(r):
         sid = r.get("id")
         ex = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
         w = _get_weekly_macd_state(sid, ex)
         if not w.get("bull"): return None
+        if require_above_zero and not w.get("above_zero"): return None
         r_out = dict(r)
         dif = r.get("dif",0); dea = r.get("dea",0)
         div_score = (r.get("div") or {}).get("score", 0)
@@ -2368,10 +2373,11 @@ def api_scan_condition_e():
         if div_score >= 2:        score += 2; flags.append(f"日底背離{div_score}")
         if r.get("vol_ratio",0) >= 1.0 and r.get("change_pct",0) > 0:
             score += 1; flags.append("帶量紅K")
+        if score < min_score: return None
         r_out["weekly_macd"]   = w
         r_out["e_score"]       = score
         r_out["buy_mode"]      = "E"
-        r_out["buy_reasons"]   = ["日週MACD共振", "週MACD多頭", "日MACD金叉", "站上MA20"] + flags
+        r_out["buy_reasons"]   = ["日週MACD共振", "週MACD強多", "日MACD金叉", "站上MA20"] + flags
         return r_out
 
     hits = []
