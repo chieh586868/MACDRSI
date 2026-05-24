@@ -588,6 +588,14 @@ def _prev_scalar(s, default=0.0):
     except Exception:
         return default
 
+def _prev2_scalar(s, default=0.0):
+    """倒數第三個值（2 日前）"""
+    try:
+        v = s.values[-3]
+        return default if v != v else float(v)
+    except Exception:
+        return default
+
 def eval_strategies(ind: dict, closes: pd.Series, volumes: pd.Series) -> list:
     if len(closes) < 3:
         return []
@@ -1252,6 +1260,7 @@ def analyze_stock(stock: dict) -> dict:
         "ma20": _last_scalar(ind.get("ma20", pd.Series([0]))) if ind else 0,
         "ma60": _last_scalar(ind.get("ma60", pd.Series([0]))) if ind else 0,
         "prev_close": _prev_scalar(closes) if has_history else 0,
+        "prev2_high": _prev2_scalar(highs) if has_history else 0,
         "prev_ma5":   _prev_scalar(ind.get("ma5",  pd.Series([0]))) if ind else 0,
         "prev_ma10":  _prev_scalar(ind.get("ma10", pd.Series([0]))) if ind else 0,
         "dif":  _last_scalar(ind.get("dif",  pd.Series([0]))) if ind else 0,
@@ -1640,7 +1649,7 @@ def push_scan_summary(mode: str, rows: list, max_show: int = 15):
         _manual_push_last[mode] = datetime.now()
     mode_label = {"A":"UT+威廉+背離","B":"UT+費波南+週線威廉波浪","C+":"UT+費費+威廉+週MACD多頭",
                   "D":"日週雙重背離","E":"日週MACD共振(依進場優先分排序)",
-                  "F":"週線威廉波浪完成"}.get(mode, mode)
+                  "F":"週威廉波浪+ABCDE任一+昨日回檔(嚴格)"}.get(mode, mode)
     lines = [f"📊 <b>條件 {mode} 掃描完成</b>",
              f"🕐 {datetime.now().strftime('%H:%M:%S')}  找到 {len(rows)} 支",
              f"📋 {mode_label}", ""]
@@ -1956,7 +1965,7 @@ def api_scan_buysignal():
             if triggered:
                 sid_b = r.get("id")
                 ex_b  = next((s.get("ex","tse") for s in watchlist if s["id"]==sid_b), "tse")
-                wkw = _get_weekly_williams_state(sid_b, ex_b)
+                wkw = _get_weekly_williams_state(sid_b, ex_b, preset="B")
                 if not wkw.get("wave_complete"):
                     triggered = False
                 else:
@@ -2286,13 +2295,24 @@ def _get_weekly_macd_state(sid: str, ex: str = "tse") -> dict:
         return empty
 
 
-def _get_weekly_williams_state(sid: str, ex: str = "tse") -> dict:
+# 週線威廉波浪參數預設（B / F 各自獨立，互不影響）：
+#   B：寬鬆（沿用日線參數），B 的嚴格度來自 UT+費波南，週威廉只當多一道確認
+#   F：收緊（剛脫離 + 波峰≥4 + 深底窗口6-26週），避免普漲日假脫離
+_WEEKLY_WR_PRESETS = {
+    "B": {"window_min":8, "window_max":21, "min_peaks":3,
+          "deep_low_thr":-85.0, "escape_thr":-50.0, "fresh_escape":False},
+    "F": {"window_min":6, "window_max":26, "min_peaks":4,
+          "deep_low_thr":-85.0, "escape_thr":-50.0, "fresh_escape":True},
+}
+
+def _get_weekly_williams_state(sid: str, ex: str = "tse", preset: str = "F") -> dict:
     """回傳週線威廉波浪狀態：wave_complete/deep_low_val/bars_from_low/peak_count/wr_now。
-    把日線 history resample 成週 K，丟給同一個 calc_williams_signals_v4 演算法。
-    7 天內共用快取（週線一週才變一次）。窗口語意變為「週」：8-21 週的中期波浪。"""
+    把日線 history resample 成週 K，丟給 calc_williams_signals_v4。
+    preset 決定波浪參數（B 寬 / F 嚴），cache 以 (sid, preset) 為 key 避免互相污染。"""
     now_ts = time.time()
+    ckey = (sid, preset)
     with _weekly_wr_lock:
-        entry = _weekly_wr_cache.get(sid)
+        entry = _weekly_wr_cache.get(ckey)
         if entry and (now_ts - entry[1]) < _WEEKLY_CACHE_TTL and isinstance(entry[0], dict):
             return entry[0]
     empty = {"wave_complete":False,"deep_low_val":0.0,"bars_from_low":0,
@@ -2300,19 +2320,17 @@ def _get_weekly_williams_state(sid: str, ex: str = "tse") -> dict:
     try:
         df = fetch_history(sid, period="2y", ex=ex)   # 週線需 ~60 根 → 抓 2 年
         if len(df) < 60:
-            with _weekly_wr_lock: _weekly_wr_cache[sid] = (empty, now_ts)
+            with _weekly_wr_lock: _weekly_wr_cache[ckey] = (empty, now_ts)
             return empty
         df.index = pd.to_datetime(df.index)
         wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
                                           "Close":"last","Volume":"sum"}).dropna()
         if len(wdf) < 30:
-            with _weekly_wr_lock: _weekly_wr_cache[sid] = (empty, now_ts)
+            with _weekly_wr_lock: _weekly_wr_cache[ckey] = (empty, now_ts)
             return empty
-        # 週線專屬收緊參數：剛脫離 + 波峰≥4 + 深底窗口6-26週（避免普漲日假脫離）
-        wk_wave_params = {"window_min":6, "window_max":26, "min_peaks":4,
-                           "deep_low_thr":-85.0, "escape_thr":-50.0, "fresh_escape":True}
+        wave_params = _WEEKLY_WR_PRESETS.get(preset, _WEEKLY_WR_PRESETS["F"])
         wr_res = calc_williams_signals_v4(wdf["Close"], wdf["High"], wdf["Low"],
-                                           wave_params=wk_wave_params)
+                                           wave_params=wave_params)
         wi = wr_res.get("wave_info", {})
         state = {
             "wave_complete": bool(wi.get("wave_complete", False)),
@@ -2321,10 +2339,10 @@ def _get_weekly_williams_state(sid: str, ex: str = "tse") -> dict:
             "peak_count":    wi.get("peak_count", 0),
             "wr_now":        wr_res.get("wr_now", -50.0),
         }
-        with _weekly_wr_lock: _weekly_wr_cache[sid] = (state, now_ts)
+        with _weekly_wr_lock: _weekly_wr_cache[ckey] = (state, now_ts)
         return state
     except Exception:
-        with _weekly_wr_lock: _weekly_wr_cache[sid] = (empty, now_ts)
+        with _weekly_wr_lock: _weekly_wr_cache[ckey] = (empty, now_ts)
         return empty
 
 
@@ -2526,14 +2544,68 @@ def api_scan_condition_e():
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
 
+def _f_pullback_ok(r):
+    """昨日回檔確認：1日前收盤<2日前最高 且 (1日前收盤≤1日前MA5 或 1日前收盤≤1日前MA10)。
+    意義：今天觸發買訊之前，昨天才剛從短均下方/前高下方回檔過 → 不追高。"""
+    pc   = r.get("prev_close", 0)
+    ph   = r.get("prev2_high", 0)
+    pm5  = r.get("prev_ma5", 0)
+    pm10 = r.get("prev_ma10", 0)
+    if pc <= 0 or ph <= 0:
+        return False
+    return pc < ph and ((pm5 > 0 and pc <= pm5) or (pm10 > 0 and pc <= pm10))
+
+
+def _f_union_abcde(r, e_ids):
+    """是否符合 A/B/C/D/E 任一。A/B/C/D 用 cache 即時判斷，E 用預先算好的命中集合。"""
+    has_fib = bool(r.get("fib",{}).get("buy_signals"))
+    has_ut  = bool(r.get("ut_buy"))
+    has_wr  = bool(r.get("wr",{}).get("buy_signals"))
+    div     = r.get("div",{})
+    has_div = bool(div.get("buy_signals")) or div.get("score",0) >= 2
+    close = r.get("close",0); ma5=r.get("ma5",0); ma10=r.get("ma10",0)
+    ma20=r.get("ma20",0); ma60=r.get("ma60",0)
+    ut_trail=r.get("ut_trail",0); change_pct=r.get("change_pct",0)
+    confirm_score=(r.get("confirm") or {}).get("score",0)
+    fib_d=r.get("fib",{}).get("details",{})
+    fib_ma3=fib_d.get("ma3",ma5); fib_ma5=fib_d.get("ma5",ma5)
+    fib_above_ma = close>0 and ((fib_ma3>0 and close>=fib_ma3*0.995) or
+                                (fib_ma5>0 and close>=fib_ma5*0.995) or
+                                (ma5>0 and close>=ma5*0.995))
+    ut_above_trail = close>0 and (ut_trail<=0 or close>=ut_trail*0.995)
+    not_falling = change_pct >= -1.0
+    above_short_ma = close>0 and ((ma5>0 and close>=ma5*0.995) or (ma10>0 and close>=ma10*0.995))
+    vol_ratio_ok = r.get("vol_ratio",0) >= 1.2
+    rising_strong = change_pct >= 1.0
+    prev_close=r.get("prev_close",0); prev_ma5=r.get("prev_ma5",0); prev_ma10=r.get("prev_ma10",0)
+    below_ma_yesterday = ((prev_ma5>0 and prev_close>0 and prev_close<prev_ma5) or
+                          (prev_ma10>0 and prev_close>0 and prev_close<prev_ma10))
+    ma_vals=[v for v in (ma5,ma10,ma20,ma60) if v>0]
+    ma_loose=True
+    if len(ma_vals)>=3 and min(ma_vals)>0:
+        cluster=(max(ma_vals)-min(ma_vals))/min(ma_vals)*100
+        ma_loose=(cluster>=2.5) or (r.get("vol_ratio",0)>=2.5 and change_pct>=2.0) or below_ma_yesterday
+    common = ut_above_trail and not_falling and above_short_ma and vol_ratio_ok and rising_strong and ma_loose
+    is_a = has_ut and has_wr and has_div and common
+    is_b = has_ut and has_fib and fib_above_ma and common
+    is_c = has_ut and has_fib and has_wr and (confirm_score>4) and common
+    is_d = has_div and (div.get("score",0)>=4 or div.get("regular_count",0)>=1) and not_falling
+    is_e = r.get("id") in e_ids
+    tags = []
+    if is_a: tags.append("A")
+    if is_b: tags.append("B")
+    if is_c: tags.append("C")
+    if is_d: tags.append("D")
+    if is_e: tags.append("E")
+    return tags
+
+
 @app.route("/api/scan/condition_f", methods=["GET"])
 def api_scan_condition_f():
-    """條件 F：週線威廉波浪完成（中期底部波浪結構）。
-    把日線 history resample 成週 K，套用威廉波浪「深底→波浪→脫離」演算法（窗口語意=週）。
-    cache 先做流動性/產業過濾當候選，再 on-demand 抓週線（7天cache，第一次慢）。
-    註：基礎版，窗口參數沿用日線設定（8-21 週），後續可再調。"""
+    """條件 F（嚴格）：週線威廉波浪完成 + 符合A/B/C/D/E任一 + 昨日回檔確認。
+    昨日回檔 = 1日前收盤<2日前最高 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
+    流程：cache 先用「昨日回檔 + A/B/C/D/E任一」過濾（便宜）→ 再 on-demand 抓週線威廉(F參數,嚴)。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
-    min_vol_ratio = float(request.args.get("min_vol_ratio", "0"))  # F 預設不卡量比
     with cache_lock: cached = list(cache.values())
     if not cached:
         return jsonify({"error":"請先執行主掃描","data":[],"hit_count":0,"mode":"F"}), 400
@@ -2542,10 +2614,23 @@ def api_scan_condition_f():
         if not exclude_traditional: return True
         return not is_excluded_industry(industry_map.get(sid, ""))
 
-    candidates = [r for r in cached
-                  if r.get("volume",0) >= 20
-                  and r.get("vol_ratio",0) >= min_vol_ratio
-                  and _ind_ok(r.get("id",""))]
+    # E 命中集合一次算好（E 內含週MACD，7天cache）
+    try:
+        e_hits, _ = scan_condition_e(cached, exclude_traditional=exclude_traditional)
+        e_ids = {h.get("id") for h in e_hits}
+    except Exception:
+        e_ids = set()
+
+    # 便宜的前置過濾：流動性 + 昨日回檔 + 符合A/B/C/D/E任一
+    candidates = []
+    f_tags_by_id = {}
+    for r in cached:
+        if r.get("volume",0) < 20 or not _ind_ok(r.get("id","")): continue
+        if not _f_pullback_ok(r): continue
+        tags = _f_union_abcde(r, e_ids)
+        if not tags: continue
+        f_tags_by_id[r.get("id")] = tags
+        candidates.append(r)
     if not candidates:
         return jsonify(sanitize({"data":[],"total":len(cached),"hit_count":0,"mode":"F",
                                   "candidates":0,"scanned_at":datetime.now().strftime("%H:%M:%S")}))
@@ -2553,7 +2638,7 @@ def api_scan_condition_f():
     def check(r):
         sid = r.get("id")
         ex  = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
-        wkw = _get_weekly_williams_state(sid, ex)
+        wkw = _get_weekly_williams_state(sid, ex, preset="F")
         if not wkw.get("wave_complete"): return None
         r_out = dict(r)
         r_out["weekly_wr"]   = wkw
@@ -2561,7 +2646,9 @@ def api_scan_condition_f():
         r_out["buy_reasons"] = [
             f"週線威廉波浪完成(深底WR{wkw.get('deep_low_val',0):.0f}，"
             f"{wkw.get('bars_from_low',0)}週前，{wkw.get('peak_count',0)}個波峰，"
-            f"今週WR{wkw.get('wr_now',0):.0f}脫離超賣)"]
+            f"今週WR{wkw.get('wr_now',0):.0f}脫離超賣)",
+            f"符合條件 {'/'.join(f_tags_by_id.get(sid, []))}",
+            "昨日回檔確認(昨收<前日高且≤短均)"]
         return r_out
 
     hits = []
@@ -2767,7 +2854,7 @@ def api_why(sid):
         gates = {**common, "has_UT":has_ut, "has_威廉":has_wr, "has_背離":has_div}
     elif mode == "B":
         ex_b = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
-        wkw_b = _get_weekly_williams_state(sid, ex_b)
+        wkw_b = _get_weekly_williams_state(sid, ex_b, preset="B")
         gates = {**common, "has_UT":has_ut, "has_費波南":has_fib, "費波南在MA上":fib_above_ma,
                  "週線威廉波浪完成": bool(wkw_b.get("wave_complete"))}
     else:  # C
