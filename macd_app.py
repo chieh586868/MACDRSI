@@ -1620,9 +1620,36 @@ load_watchlist2()
 # ══════════════════════════════════════════════════════════
 # ▌ Telegram
 # ══════════════════════════════════════════════════════════
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+def _load_telegram_config():
+    """Telegram 設定來源優先序：環境變數 > 同資料夾 telegram_config.txt。
+    設定檔每行 KEY=VALUE：
+        TELEGRAM_TOKEN=機器人金鑰
+        TELEGRAM_CHAT_ID=你的聊天室ID
+    檔案放 macd_app.py 同資料夾，不進 git、curl 更新也不會被覆蓋 → 設一次永久有效。"""
+    token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    chat  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    try:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram_config.txt")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip().upper(); v = v.strip().strip('"').strip("'")
+                    if   k == "TELEGRAM_TOKEN"   and not token: token = v   # 環境變數優先
+                    elif k == "TELEGRAM_CHAT_ID" and not chat:  chat  = v
+    except Exception as e:
+        print(f"⚠ 讀取 telegram_config.txt 失敗: {e}")
+    return token, chat
+
+TELEGRAM_TOKEN, TELEGRAM_CHAT_ID = _load_telegram_config()
 TELEGRAM_API     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+    print(f"✓ Telegram 已設定 (chat_id={TELEGRAM_CHAT_ID})")
+else:
+    print("⚠ Telegram 未設定：設環境變數 TELEGRAM_TOKEN/TELEGRAM_CHAT_ID，或在同資料夾放 telegram_config.txt")
 telegram_enabled = True   # ★ UI 可動態開關（不需重啟）
 
 def send_telegram(msg):

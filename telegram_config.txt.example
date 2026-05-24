@@ -1,0 +1,12 @@
+# Telegram 通知設定範本
+# 使用方式：把這個檔案「複製」一份、改名為 telegram_config.txt（去掉 .example），
+# 填入你的 token 與 chat_id，存檔後重新啟動 macd_app.py 即可。
+# 此檔放在 macd_app.py 同一個資料夾。telegram_config.txt 不會進 git，curl 更新也不會被覆蓋。
+#
+# 取得方式：
+#   TELEGRAM_TOKEN   → Telegram 搜尋 @BotFather → /mybots → 你的機器人 → API Token
+#   TELEGRAM_CHAT_ID → 先傳訊息給你的機器人，再開 https://api.telegram.org/bot<TOKEN>/getUpdates
+#                      找 "chat":{"id":xxxxx} 那個數字（或用 @userinfobot 取得）
+
+TELEGRAM_TOKEN=在這裡貼上你的token
+TELEGRAM_CHAT_ID=在這裡貼上你的chat_id

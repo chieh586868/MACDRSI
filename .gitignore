@@ -3,3 +3,4 @@ __pycache__/
 *.pyo
 scan_cache.pkl
 hist_cache.pkl
+telegram_config.txt
