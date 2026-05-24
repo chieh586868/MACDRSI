@@ -2317,13 +2317,13 @@ def api_scan_condition_c_strict():
 
 @app.route("/api/scan/condition_e", methods=["GET"])
 def api_scan_condition_e():
-    """條件 E：日週 MACD 共振（強勢多頭順勢）
-    必要：週MACD零軸上(強多) + 週DIF>DEA + 日MACD金叉 + 站上MA20 + 量比≥1.5
-    加分：週剛金叉、週紅柱放大、日金叉在零軸下(起漲)、日底背離、帶量紅K
+    """條件 E：日週 MACD 共振（順勢）
+    必要：週DIF>DEA(多頭) + 日MACD金叉 + 站上MA20 + 量比≥1.5
+    加分：週零軸上(強多)、週剛金叉、週紅柱放大、日金叉在零軸下(起漲)、日底背離、帶量紅K
     最後只回 E評分≥min_score。on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
     min_vol_ratio = float(request.args.get("min_vol_ratio", "1.5"))
-    require_above_zero = request.args.get("require_above_zero", "1") != "0"
+    require_above_zero = request.args.get("require_above_zero", "0") != "0"
     min_score = int(request.args.get("min_score", "6"))
     with cache_lock: cached = list(cache.values())
     if not cached:
@@ -2377,7 +2377,7 @@ def api_scan_condition_e():
         r_out["weekly_macd"]   = w
         r_out["e_score"]       = score
         r_out["buy_mode"]      = "E"
-        r_out["buy_reasons"]   = ["日週MACD共振", "週MACD強多", "日MACD金叉", "站上MA20"] + flags
+        r_out["buy_reasons"]   = ["日週MACD共振", "週MACD多頭", "日MACD金叉", "站上MA20"] + flags
         return r_out
 
     hits = []
