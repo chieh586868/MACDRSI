@@ -1638,16 +1638,31 @@ def push_scan_summary(mode: str, rows: list, max_show: int = 15):
         if last and (datetime.now() - last).total_seconds() < 300:
             return
         _manual_push_last[mode] = datetime.now()
-    mode_label = {"A":"UT+威廉+背離","B":"UT+費波南","C+":"UT+費費+威廉+週MACD多頭","D":"日週雙重背離"}.get(mode, mode)
+    mode_label = {"A":"UT+威廉+背離","B":"UT+費波南","C+":"UT+費費+威廉+週MACD多頭",
+                  "D":"日週雙重背離","E":"日週MACD共振(依進場優先分排序)"}.get(mode, mode)
     lines = [f"📊 <b>條件 {mode} 掃描完成</b>",
              f"🕐 {datetime.now().strftime('%H:%M:%S')}  找到 {len(rows)} 支",
              f"📋 {mode_label}", ""]
-    for i, r in enumerate(rows[:max_show], 1):
-        c = r.get("change_pct", 0)
-        arrow = "▲" if c > 0 else "▼"
-        lines.append(f"{i}. <b>{r.get('name','')}({r.get('id','')})</b> "
-                     f"${r.get('close',0):.2f} {arrow}{abs(c):.2f}% "
-                     f"量{r.get('volume',0)}")
+    if mode == "E":
+        for i, r in enumerate(rows[:max_show], 1):
+            c = r.get("change_pct", 0)
+            arrow = "▲" if c > 0 else "▼"
+            wk = r.get("weekly_macd") or {}
+            wtag = "週零軸上" if wk.get("above_zero") else "週零軸下"
+            if wk.get("golden_cross"): wtag += "剛金叉"
+            div_s = (r.get("div") or {}).get("score", 0)
+            dtag = f" 背離{div_s}" if div_s >= 2 else ""
+            lines.append(f"{i}. <b>{r.get('name','')}({r.get('id','')})</b> "
+                         f"${r.get('close',0):.2f} {arrow}{abs(c):.2f}%")
+            lines.append(f"    優先{r.get('prio',0)}分 ｜ E{r.get('e_score',0)} ｜ "
+                         f"{r.get('level_tag','')}(離MA20 {r.get('bias20','?')}%) ｜ {wtag}{dtag}")
+    else:
+        for i, r in enumerate(rows[:max_show], 1):
+            c = r.get("change_pct", 0)
+            arrow = "▲" if c > 0 else "▼"
+            lines.append(f"{i}. <b>{r.get('name','')}({r.get('id','')})</b> "
+                         f"${r.get('close',0):.2f} {arrow}{abs(c):.2f}% "
+                         f"量{r.get('volume',0)}")
     if len(rows) > max_show:
         lines.append(f"...另 {len(rows)-max_show} 支")
     lines.append("\n⚠ 僅供參考")
@@ -2315,6 +2330,39 @@ def api_scan_condition_c_strict():
                               "scanned_at":datetime.now().strftime("%H:%M:%S")}))
 
 
+def _e_priority(r):
+    """進場優先分(0-100)：把看線型會檢查的東西量化，解決一次20檔無法逐一看圖的問題。
+    四大支柱各 25 分：訊號強度 / 趨勢結構(均線多頭排列) / 進場位階(乖離率,追高扣分) / 多重確認+量能。
+    回傳 (優先分, 位階標籤, 離MA20乖離%)。"""
+    e_score = r.get("e_score", 0)
+    close = r.get("close",0); ma5=r.get("ma5",0); ma10=r.get("ma10",0)
+    ma20=r.get("ma20",0); ma60=r.get("ma60",0)
+    # 1. 訊號強度 (0-25)：日週共振+背離越強越高
+    p_sig = e_score / 9.0 * 25
+    # 2. 趨勢結構 (0-25)：均線多頭排列越完整越好
+    if   ma5>ma10>ma20>ma60>0: p_struct = 25
+    elif close>ma20>ma60>0:    p_struct = 15
+    elif close>ma20>0:         p_struct = 8
+    else:                      p_struct = 0
+    # 3. 進場位階 (0-25)：離 MA20 乖離率，越貼近月線越好，追高扣分
+    bias = ((close-ma20)/ma20*100) if ma20>0 else 99
+    if   bias <= 5:  p_level, level_tag = 25, "剛突破✓"
+    elif bias <= 8:  p_level, level_tag = 20, "小幅乖離"
+    elif bias <= 12: p_level, level_tag = 13, "乖離中等"
+    elif bias <= 18: p_level, level_tag = 6,  "乖離偏大"
+    else:            p_level, level_tag = 2,  "追高⚠"
+    # 4. 多重確認 + 量能 (0-25)
+    p_conf = 0
+    if r.get("ut_buy"):                          p_conf += 8
+    if (r.get("fib") or {}).get("buy_signals"):  p_conf += 5
+    if (r.get("wr")  or {}).get("buy_signals"):  p_conf += 5
+    vr = r.get("vol_ratio", 0)
+    p_conf += 7 if vr >= 2 else (4 if vr >= 1.5 else 0)
+    p_conf = min(p_conf, 25)
+    prio = round(p_sig + p_struct + p_level + p_conf)
+    return prio, level_tag, round(bias, 1)
+
+
 @app.route("/api/scan/condition_e", methods=["GET"])
 def api_scan_condition_e():
     """條件 E：日週 MACD 共振（順勢）
@@ -2376,6 +2424,10 @@ def api_scan_condition_e():
         if score < min_score: return None
         r_out["weekly_macd"]   = w
         r_out["e_score"]       = score
+        prio, level_tag, bias = _e_priority(r_out)
+        r_out["prio"]          = prio
+        r_out["level_tag"]     = level_tag
+        r_out["bias20"]        = bias
         r_out["buy_mode"]      = "E"
         r_out["buy_reasons"]   = ["日週MACD共振", "週MACD多頭", "日MACD金叉", "站上MA20"] + flags
         return r_out
@@ -2388,7 +2440,7 @@ def api_scan_condition_e():
             if res: hits.append(res)
         except Exception: pass
 
-    hits.sort(key=lambda x: (-x.get("e_score",0), -x.get("change_pct",0)))
+    hits.sort(key=lambda x: (-x.get("prio",0), -x.get("e_score",0), -x.get("change_pct",0)))
     push_scan_summary("E", hits)
     return jsonify(sanitize({"data":hits,"total":len(cached),"hit_count":len(hits),
                               "mode":"E","candidates":len(candidates),
@@ -2623,9 +2675,9 @@ def api_export_csv():
     buf.write("﻿")  # BOM for Excel UTF-8
     w = csv.writer(buf)
     if mode == "E":
-        # 條件 E 專屬：顯示 E 評分、週 MACD 狀態、共振品質標記，方便分級
-        w.writerow(["#","股號","名稱","現價","漲跌","漲跌幅%","成交量(張)","量比",
-                    "MA5","MA10","MA20","MA60","E評分","週MACD狀態","日底背離","共振品質"])
+        # 條件 E 專屬：優先分排序 + 進場位階 + 週MACD狀態 + 共振品質，方便不看圖直接決定買進順序
+        w.writerow(["#","股號","名稱","現價","漲跌幅%","量比","進場優先分","E評分",
+                    "位階","離MA20%","週MACD狀態","日底背離","共振品質","MA20","MA60"])
         for i, r in enumerate(rows, 1):
             wk  = r.get("weekly_macd") or {}
             div = r.get("div") or {}
@@ -2635,10 +2687,11 @@ def api_export_csv():
             base = {"日週MACD共振","週MACD多頭","日MACD金叉","站上MA20"}
             flags = [x for x in (r.get("buy_reasons") or []) if x not in base]
             w.writerow([i, r.get("id",""), r.get("name",""),
-                        r.get("close",0), r.get("change",0), r.get("change_pct",0),
-                        r.get("volume",0), r.get("vol_ratio",0),
-                        r.get("ma5",0), r.get("ma10",0), r.get("ma20",0), r.get("ma60",0),
-                        r.get("e_score",0), weekly_txt, div.get("score",0), " ".join(flags)])
+                        r.get("close",0), r.get("change_pct",0), r.get("vol_ratio",0),
+                        r.get("prio",0), r.get("e_score",0),
+                        r.get("level_tag",""), r.get("bias20",""),
+                        weekly_txt, div.get("score",0), " ".join(flags),
+                        r.get("ma20",0), r.get("ma60",0)])
         csv_data = buf.getvalue()
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         return Response(csv_data, mimetype="text/csv",
