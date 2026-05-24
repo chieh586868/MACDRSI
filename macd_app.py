@@ -2676,6 +2676,7 @@ def api_scan_condition_f():
         r_out = dict(r)
         r_out["weekly_wr"]   = wkw
         r_out["buy_mode"]    = "F"
+        r_out["f_tags"]      = f_tags_by_id.get(sid, [])
         r_out["buy_reasons"] = [
             f"週線威廉波浪完成(深底WR{wkw.get('deep_low_val',0):.0f}，"
             f"{wkw.get('bars_from_low',0)}週前，{wkw.get('peak_count',0)}個波峰，"
@@ -2951,6 +2952,26 @@ def api_export_csv():
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         return Response(csv_data, mimetype="text/csv",
             headers={"Content-Disposition": f"attachment; filename=scan_E_{ts}.csv"})
+
+    if mode == "F":
+        # 條件 F 專屬：直接看出每檔憑什麼進 F（符合哪個條件 + 週威廉波浪 + 昨日回檔數據）
+        w.writerow(["#","股號","名稱","現價","漲跌幅%","量比","符合條件",
+                    "週威廉深底WR","波峰數","距今(週)","週WR現值",
+                    "昨收","近3日高","昨MA5","昨MA10","MA20","MA60"])
+        for i, r in enumerate(rows, 1):
+            wk = r.get("weekly_wr") or {}
+            w.writerow([i, r.get("id",""), r.get("name",""),
+                        r.get("close",0), r.get("change_pct",0), r.get("vol_ratio",0),
+                        "/".join(r.get("f_tags", [])),
+                        wk.get("deep_low_val",""), wk.get("peak_count",""),
+                        wk.get("bars_from_low",""), wk.get("wr_now",""),
+                        r.get("prev_close",0), r.get("prev3_high",0),
+                        r.get("prev_ma5",0), r.get("prev_ma10",0),
+                        r.get("ma20",0), r.get("ma60",0)])
+        csv_data = buf.getvalue()
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        return Response(csv_data, mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=scan_F_{ts}.csv"})
 
     w.writerow(["#","股號","名稱","現價","漲跌","漲跌幅%","成交量(張)","量比",
                 "MA5","MA10","MA20","MA60","背離分數","週背離分數","來源","訊號"])
