@@ -2793,13 +2793,13 @@ def _g_signal_states(r):
             "wr":has_wr, "div":has_div}
 
 
-def _change_signal_counts(sid, ex, today_close):
-    """回傳 (昨日突破數, 今日突破數)：以『1日前收盤』與『今日即時收盤』分別當突破者，
-    各突破了幾個變盤訊號壓力區(0~6)。資料不足回 (None, None)。
-    壓力區相對各自突破者往前取 1/2/3/(4或5)/8/13 根；
-    紅K(收≥開)壓力=開盤價、黑K(收<開)壓力=(開+收)/2；突破=收盤 > 壓力(嚴格大於)；
-    『4或5』任一被突破即算 1 個（各自最多 6 個）。
-    今日突破者用 today_close(盤中即時價)，所以盤中會隨價格變動。"""
+def _change_signal_counts(sid, ex, today_close, prev_close):
+    """回傳 (昨日突破數, 今日突破數)：以 cache 的『1日前收盤(prev_close)』與
+    『今日即時收盤(today_close)』分別當突破者，各突破幾個變盤訊號壓力區(0~6)。
+    壓力區(阻力)取自日線歷史，相對各自突破者往前 1/2/3/(4或5)/8/13 根；
+    紅K(收≥開)阻力=開盤價、黑K(收<開)阻力=(開+收)/2；突破=收盤 > 阻力(嚴格大於)；
+    『4或5』任一被突破即算 1 個。資料不足回 (None, None)。
+    用 cache 收盤值對齊歷史(比 date 判斷穩健，盤中/盤後/週末皆正確)。"""
     try:
         df = fetch_history(sid, ex=ex)
     except Exception:
@@ -2808,12 +2808,14 @@ def _change_signal_counts(sid, ex, today_close):
         return None, None
     closes = df["Close"].values.astype(float)
     opens  = (df["Open"] if "Open" in df.columns else df["Close"]).values.astype(float)
-    # base：1日前在序列尾端的位置（歷史最後一根是今日 → 1日前=-2，否則=-1）
-    try:
-        base = 2 if pd.to_datetime(df.index[-1]).date() == date.today() else 1
-    except Exception:
-        base = 1
-    if len(closes) < base + 13:
+    last = closes[-1]
+    # 對齊：歷史最後一根較接近「今日收盤」→ 今日在尾端、1日前=-2；
+    #       較接近「1日前收盤」→ 今日尚未進歷史、最後一根就是1日前=-1。
+    if prev_close and prev_close > 0 and abs(last - today_close) > abs(last - prev_close):
+        prev_idx = -1
+    else:
+        prev_idx = -2
+    if len(closes) < 13 - prev_idx:    # prev_count 最遠用到 index prev_idx-13
         return None, None
 
     def count(breaker, start_idx):
@@ -2832,9 +2834,9 @@ def _change_signal_counts(sid, ex, today_close):
             if breaker > zone(k): n += 1
         return n
 
-    prev_idx    = -base                                  # 1日前 索引
-    prev_count  = count(closes[prev_idx], prev_idx - 1)  # 1日前：往前一根起算
-    today_count = count(today_close,      prev_idx)      # 今日：往前一根=1日前起算
+    prev_breaker = prev_close if (prev_close and prev_close > 0) else closes[prev_idx]
+    prev_count   = count(prev_breaker, prev_idx - 1)   # 1日前：往前一根起算
+    today_count  = count(today_close,  prev_idx)       # 今日：往前一根=1日前起算
     return prev_count, today_count
 
 
@@ -2883,7 +2885,7 @@ def scan_condition_g(cached, exclude_traditional=True):
             if wkw.get("wave_complete"): g2.append("週威廉波浪")
         if not g2: return None
         # 第3點：1日前突破<4(尚未起漲) → 留下；今日突破數(盤中即時)→ 顯示，≥4=買點
-        prev_n, today_n = _change_signal_counts(sid, ex, r.get("close", 0))
+        prev_n, today_n = _change_signal_counts(sid, ex, r.get("close", 0), r.get("prev_close", 0))
         if prev_n is None or prev_n >= 4: return None
         today_n = today_n if today_n is not None else 0
         g1 = "UT" if st["ut"] else "費波南"
