@@ -2522,7 +2522,8 @@ def _e_priority(r):
 
 def scan_condition_e(cached, exclude_traditional=True, min_vol_ratio=1.5,
                       require_above_zero=False, min_score=6, max_bias=12.0):
-    """條件 E 掃描核心，回傳 (hits, candidate_count)。供 API route 與自動排程共用。"""
+    """條件 E 掃描核心，回傳 (hits, candidate_count)。供 API route 與自動排程共用。
+    含昨日回檔過濾：1日前收盤 ≤ 1日前MA5 或 ≤ 1日前MA10。"""
     def _ind_ok(sid):
         if not exclude_traditional: return True
         return not is_excluded_industry(industry_map.get(sid, ""))
@@ -2533,6 +2534,11 @@ def scan_condition_e(cached, exclude_traditional=True, min_vol_ratio=1.5,
         if r.get("volume", 0) < 20: continue
         if r.get("vol_ratio", 0) < min_vol_ratio: continue
         if not _ind_ok(r.get("id","")): continue
+        # 昨日回檔：1日前收盤 ≤ 1日前MA5 或 ≤ 1日前MA10
+        pc = r.get("prev_close", 0)
+        pm5 = r.get("prev_ma5", 0); pm10 = r.get("prev_ma10", 0)
+        if not (pc > 0 and ((pm5 > 0 and pc <= pm5) or (pm10 > 0 and pc <= pm10))):
+            continue
         close = r.get("close", 0); ma20 = r.get("ma20", 0)
         dif = r.get("dif", 0); dea = r.get("dea", 0)
         prev_dif = r.get("prev_dif", 0); prev_dea = r.get("prev_dea", 0)
@@ -2575,7 +2581,8 @@ def scan_condition_e(cached, exclude_traditional=True, min_vol_ratio=1.5,
         r_out["level_tag"]     = level_tag
         r_out["bias20"]        = bias
         r_out["buy_mode"]      = "E"
-        r_out["buy_reasons"]   = ["日週MACD共振", "週MACD多頭", "日MACD金叉", "站上MA20"] + flags
+        r_out["buy_reasons"]   = ["日週MACD共振", "週MACD多頭", "日MACD金叉", "站上MA20",
+                                   "昨日回檔(昨收≤昨MA5或MA10)"] + flags
         return r_out
 
     hits = []
@@ -2594,6 +2601,7 @@ def scan_condition_e(cached, exclude_traditional=True, min_vol_ratio=1.5,
 def api_scan_condition_e():
     """條件 E：日週 MACD 共振（順勢）
     必要：週DIF>DEA(多頭) + 日MACD金叉 + 站上MA20 + 量比≥1.5 + 離MA20乖離≤max_bias%
+         + 昨日回檔(1日前收盤≤1日前MA5 或 ≤1日前MA10)
     加分：週零軸上(強多)、週剛金叉、週紅柱放大、日金叉在零軸下(起漲)、日底背離、帶量紅K
     最後只回 E評分≥min_score。on-demand 抓週線（同 D），第一次慢、之後 7 天 cache。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
