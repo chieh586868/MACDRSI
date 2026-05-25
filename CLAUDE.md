@@ -5,10 +5,12 @@
 前端有操作介面,後端負責抓資料、計算指標、回傳符合條件的股票清單。
 
 ## 技術架構
-- 前端:（填你的框架,例如 React / 純 HTML+JS）
-- 後端:（填語言/框架,例如 Python Flask / Node.js）
-- 資料來源:（填你抓股價的來源,例如 yfinance / 某 API）
-- 執行方式:（填怎麼啟動,例如 `python app.py` 後開 localhost:xxxx）
+- 前端:純 HTML+JS（內嵌在各自的 .py，透過 Flask `render_template_string` 提供）
+- 後端:Python Flask
+- 資料來源:`divergence_screener.py` 用 yfinance；`macd_app.py` 用永豐 Shioaji 即時（無則 TWSE 延遲20分）
+- 執行方式:
+  - `python macd_app.py` → http://localhost:5000（MACD/RSI 盤中選股，條件 A~G）
+  - `python divergence_screener.py` → http://localhost:5001（指標背離選股，條件 A/B/C + 三指標/日週雙重/共振）
 
 ## 選股邏輯（目前設定）
 - MACD 條件:（例如 MACD 黃金交叉 / DIF 上穿 DEA）
@@ -28,4 +30,7 @@
 - [ ] 
 
 ## 重要決策紀錄
-- （每次做了關鍵決定就記一行,例如「2026/5/25 改用 OR 條件放寬篩選」）
+- 2026/5/25 divergence_screener 新增條件 A/B/C，各一張「7天累積表」（超過7天自動移除、可手動刪除，存 cond_tables.json）。A=三指標背離 / 日週雙重 / 日週共振（**OR** 任一即入表）；B=週威廉波浪+日週MACD共振（日DIF>DEA 且 週DIF>DEA）；C=週威廉波浪+日威廉波浪。威廉用 williams_v4。
+- 2026/5/25 macd_app 條件G 簡化為「群1(UT/費波南)+昨日回檔+今日突破≥4=買點」，移除群2/昨日變盤<4/週變盤三層。
+- 2026/5/25 macd_app 條件E 加「昨日回檔」過濾（1日前收盤 ≤ 1日前MA5 或 ≤ 1日前MA10）。
+- 2026/5/25 移除 wr_scan.py（含外洩的永豐 API 金鑰）；金鑰已在 git 歷史，**需至永豐後台作廢並重新產生**。
