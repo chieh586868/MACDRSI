@@ -35,6 +35,7 @@ from fast_indicators import (
     calc_indicators_fast,
     warmup as fast_warmup,
 )
+from williams_v4 import calc_williams_signals_v4
 
 app = Flask(__name__)
 CORS(app)
@@ -957,6 +958,284 @@ def api_status():
 
 
 # ══════════════════════════════════════════════════════════
+# ▌ 條件 A/B/C — 7天累積表格（後端：掃描 + 儲存 + 刪除）
+#   A = (三指標背離) 或 (日週雙重背離) 或 (日週共振)        ← OR
+#   B = 週威廉波浪完成 + 日週MACD共振（日MACD多頭 且 週MACD多頭）
+#   C = 週威廉波浪完成 + 日威廉波浪完成
+#   每個條件各一張表：掃到的股票累積保留 7 天，超過 7 天自動移除，可手動刪除。
+# ══════════════════════════════════════════════════════════
+COND_TABLE_FILE = "cond_tables.json"
+COND_KEEP_DAYS  = 7
+cond_tables = {"A": {}, "B": {}, "C": {}}   # {cond: {sid: record}}
+cond_lock   = threading.Lock()
+
+
+def _load_cond_tables():
+    global cond_tables
+    try:
+        if os.path.exists(COND_TABLE_FILE):
+            with open(COND_TABLE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            for k in ("A", "B", "C"):
+                if isinstance(data.get(k), dict):
+                    cond_tables[k] = data[k]
+    except Exception:
+        pass
+
+
+def _save_cond_tables():
+    try:
+        with open(COND_TABLE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cond_tables, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _expire_old(cond):
+    """移除 last_seen 距今超過 7 天的紀錄（含今天往前共 7 個日曆日）。"""
+    cutoff = (datetime.now() - timedelta(days=COND_KEEP_DAYS - 1)).strftime("%Y-%m-%d")
+    tbl = cond_tables.get(cond, {})
+    for sid in [s for s, r in tbl.items() if r.get("last_seen", "") < cutoff]:
+        tbl.pop(sid, None)
+
+
+def _merge_hits(cond, hits):
+    """併入本次掃到的 hits：新股記 first_seen，舊股更新 last_seen 與最新數據。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    tbl = cond_tables.setdefault(cond, {})
+    for h in hits:
+        sid = h.get("id")
+        if not sid:
+            continue
+        old = tbl.get(sid)
+        rec = dict(h)
+        rec["first_seen"] = old.get("first_seen", today) if old else today
+        rec["last_seen"]  = today
+        tbl[sid] = rec
+
+
+def _cond_listing(cond):
+    """先過期、再回傳排序後清單（新到舊 → 漲幅）。呼叫端需持有 cond_lock。"""
+    _expire_old(cond)
+    rows = list(cond_tables.get(cond, {}).values())
+    rows.sort(key=lambda r: (r.get("last_seen", ""), r.get("change_pct", 0)), reverse=True)
+    return rows
+
+
+def _wave_complete(closes, highs, lows):
+    """威廉波浪完成判定（日線傳日OHLC、週線傳週OHLC）。回傳 (是否完成, 詳細)。"""
+    try:
+        res = calc_williams_signals_v4(closes, highs, lows)
+        return bool(res.get("buy_signals")), res
+    except Exception:
+        return False, {}
+
+
+def _base_record(sid, df, ind_d):
+    closes = df["Close"]; c_v = closes.values; n = len(c_v)
+    c0 = float(c_v[-1]); c1 = float(c_v[-2]) if n >= 2 else c0
+    chg = c0 - c1; chg_pct = (chg / c1 * 100) if c1 > 0 else 0.0
+    vr = _last_float(ind_d["vol_ratio"].values, 1.0)
+    name = next((s.get("name", "") for s in watchlist if s["id"] == sid), sid)
+    return {"id": sid, "name": name,
+            "close": round(c0, 2), "change": round(chg, 2),
+            "change_pct": round(chg_pct, 2), "vol_ratio": round(vr, 1),
+            "scanned_at": datetime.now().strftime("%H:%M:%S")}
+
+
+def analyze_A(stock):
+    """A = 三指標背離 OR 日週雙重背離 OR 日週共振（任一即入表）。"""
+    sid = stock["id"]; ex = stock.get("ex", "tse")
+    try:
+        df = get_hist(sid, ex, period="1y", interval="1d")
+        if len(df) < 60:
+            return None
+        closes  = df["Close"]
+        highs   = df["High"]   if "High"   in df.columns else closes
+        lows    = df["Low"]    if "Low"    in df.columns else closes
+        volumes = df["Volume"] if "Volume" in df.columns else pd.Series(1, index=closes.index)
+        ind_d = calc_ind(closes, highs, lows, volumes)
+        div_d = calc_div_score(ind_d, closes, highs, lows, volumes, max_bars=15)
+        inds  = {s["indicator"] for s in div_d["signals"]}
+        triple = {"MACD", "RSI", "KD"}.issubset(inds)
+
+        weekly_score = 0
+        wdf = _get_weekly(sid, df)
+        if len(wdf) >= 12:
+            wc = wdf["Close"]; wh = wdf["High"]; wl = wdf["Low"]; wv = wdf["Volume"]
+            ind_w = calc_ind(wc, wh, wl, wv)
+            weekly_score = calc_div_score(ind_w, wc, wh, wl, wv, max_bars=10)["score"]
+        double = div_d["score"] >= 5 and weekly_score >= 2
+        reson  = div_d["score"] >= 5 and weekly_score >= 4
+        if not (triple or double or reson):
+            return None
+
+        tags = []
+        if triple: tags.append("三指標背離")
+        if double: tags.append("日週雙重背離")
+        if reson:  tags.append("日週共振")
+        rec = _base_record(sid, df, ind_d)
+        rec.update({"div_score": div_d["score"], "weekly_score": weekly_score,
+                    "div_summary": div_d["summary"], "tags": tags})
+        return rec
+    except Exception:
+        return None
+
+
+def analyze_B(stock):
+    """B = 週威廉波浪完成 + 日週MACD共振（日MACD多頭 且 週MACD多頭）。"""
+    sid = stock["id"]; ex = stock.get("ex", "tse")
+    try:
+        df = get_hist(sid, ex, period="1y", interval="1d")
+        if len(df) < 60:
+            return None
+        closes  = df["Close"]
+        highs   = df["High"]   if "High"   in df.columns else closes
+        lows    = df["Low"]    if "Low"    in df.columns else closes
+        volumes = df["Volume"] if "Volume" in df.columns else pd.Series(1, index=closes.index)
+        ind_d = calc_ind(closes, highs, lows, volumes)
+        dif_v = ind_d["dif"].values; dea_v = ind_d["dea"].values
+        daily_macd_bull = float(dif_v[-1]) > float(dea_v[-1])
+
+        wdf = _get_weekly(sid, df)
+        if len(wdf) < 30:
+            return None
+        wc = wdf["Close"]; wh = wdf["High"]; wl = wdf["Low"]; wv = wdf["Volume"]
+        ind_w = calc_ind(wc, wh, wl, wv)
+        wdif = ind_w["dif"].values; wdea = ind_w["dea"].values
+        weekly_macd_bull = float(wdif[-1]) > float(wdea[-1])
+        if not (daily_macd_bull and weekly_macd_bull):
+            return None
+
+        wave_ok, wres = _wave_complete(wc, wh, wl)
+        if not wave_ok:
+            return None
+
+        rec = _base_record(sid, df, ind_d)
+        wi = wres.get("wave_info", {})
+        rec.update({"tags": ["週威廉波浪", "日週MACD共振"],
+                    "weekly_wr": wres.get("wr_now", 0),
+                    "deep_low_val": wi.get("deep_low_val", 0),
+                    "peak_count": wi.get("peak_count", 0),
+                    "daily_macd_bull": daily_macd_bull,
+                    "weekly_macd_bull": weekly_macd_bull})
+        return rec
+    except Exception:
+        return None
+
+
+def analyze_C(stock):
+    """C = 週威廉波浪完成 + 日威廉波浪完成。"""
+    sid = stock["id"]; ex = stock.get("ex", "tse")
+    try:
+        df = get_hist(sid, ex, period="1y", interval="1d")
+        if len(df) < 60:
+            return None
+        closes  = df["Close"]
+        highs   = df["High"]   if "High"   in df.columns else closes
+        lows    = df["Low"]    if "Low"    in df.columns else closes
+        volumes = df["Volume"] if "Volume" in df.columns else pd.Series(1, index=closes.index)
+        ind_d = calc_ind(closes, highs, lows, volumes)
+
+        d_ok, dres = _wave_complete(closes, highs, lows)
+        if not d_ok:
+            return None
+        wdf = _get_weekly(sid, df)
+        if len(wdf) < 30:
+            return None
+        w_ok, wres = _wave_complete(wdf["Close"], wdf["High"], wdf["Low"])
+        if not w_ok:
+            return None
+
+        rec = _base_record(sid, df, ind_d)
+        rec.update({"tags": ["週威廉波浪", "日威廉波浪"],
+                    "daily_wr": dres.get("wr_now", 0),
+                    "weekly_wr": wres.get("wr_now", 0)})
+        return rec
+    except Exception:
+        return None
+
+
+_COND_FN = {"A": analyze_A, "B": analyze_B, "C": analyze_C}
+
+
+def run_cond_scan(cond):
+    """掃描全市場 → 併入該條件表格 → 過期 → 回傳 (清單, 今日命中數, 耗時)。"""
+    global scan_progress
+    fn = _COND_FN[cond]
+    ensure_1y_cached()
+    stocks = list(watchlist); total = len(stocks)
+    scan_progress = {"done": 0, "total": total, "running": True, "mode": f"cond{cond}"}
+    print(f"\n  🔍 條件 {cond} 掃描：{total} 支...")
+    t0 = time.time(); hits = []
+    futures = {_executor.submit(fn, s): s for s in stocks}
+    for fut in as_completed(futures):
+        try:
+            r = fut.result(timeout=35)
+            if r:
+                hits.append(r)
+        except Exception:
+            pass
+        scan_progress["done"] += 1
+    scan_progress["running"] = False
+    elapsed = round(time.time() - t0, 1)
+    with cond_lock:
+        _merge_hits(cond, hits)
+        rows = _cond_listing(cond)
+        _save_cond_tables()
+    print(f"  ✅ 條件 {cond} 完成：今日 {len(hits)} 支、表內共 {len(rows)} 支，{elapsed} 秒")
+    return rows, len(hits), elapsed
+
+
+@app.route("/api/cond/<cond>/scan", methods=["GET"])
+def api_cond_scan(cond):
+    cond = cond.upper()
+    if cond not in _COND_FN:
+        return jsonify({"error": "未知條件，僅支援 A/B/C", "data": []}), 400
+    try:
+        rows, today_n, elapsed = run_cond_scan(cond)
+        return jsonify(sanitize({
+            "data": rows, "cond": cond,
+            "today_hits": today_n, "table_count": len(rows),
+            "total_scanned": len(watchlist), "elapsed": elapsed,
+            "keep_days": COND_KEEP_DAYS,
+            "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e), "data": []}), 500
+
+
+@app.route("/api/cond/<cond>", methods=["GET"])
+def api_cond_list(cond):
+    cond = cond.upper()
+    if cond not in _COND_FN:
+        return jsonify({"error": "未知條件，僅支援 A/B/C", "data": []}), 400
+    with cond_lock:
+        rows = _cond_listing(cond)
+        _save_cond_tables()
+    return jsonify(sanitize({"data": rows, "cond": cond,
+                             "table_count": len(rows), "keep_days": COND_KEEP_DAYS}))
+
+
+@app.route("/api/cond/<cond>/delete", methods=["POST"])
+def api_cond_delete(cond):
+    cond = cond.upper()
+    if cond not in _COND_FN:
+        return jsonify({"error": "未知條件，僅支援 A/B/C"}), 400
+    data = request.get_json(silent=True) or {}
+    sid = str(data.get("id", "")).strip()
+    if not sid:
+        return jsonify({"error": "缺少股號 id"}), 400
+    with cond_lock:
+        existed = cond_tables.get(cond, {}).pop(sid, None) is not None
+        rows = _cond_listing(cond)
+        _save_cond_tables()
+    return jsonify(sanitize({"ok": existed, "removed": sid, "cond": cond,
+                             "data": rows, "table_count": len(rows)}))
+
+
+# ══════════════════════════════════════════════════════════
 # ▌ 前端 HTML — XQ 風格大字體表格
 # ══════════════════════════════════════════════════════════
 HTML = r"""<!DOCTYPE html>
@@ -1571,6 +1850,7 @@ def startup():
     print("  🚀 背離選股系統（極速版）啟動...")
     fast_warmup()          # ★ numba 預編譯
     load_delisted()
+    _load_cond_tables()    # ★ 讀回 A/B/C 的 7 天累積表
     load_stock_list()
     batch_preload()
     incremental_refresh()  # ★ 自動偵測快取，必要時補最近 10 天

@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# runtime caches / generated data
+cond_tables.json
+hist_cache.pkl
+tw_stocks.json
+delisted_cache.json
