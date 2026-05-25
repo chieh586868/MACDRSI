@@ -1794,8 +1794,8 @@ def auto_scan_job():
                 c = h.get("change_pct", 0)
                 lines.append(f"★ <b>{h.get('name','')}({h.get('id','')})</b> "
                              f"${h.get('close',0):.1f} {'▲' if c>0 else '▼'}{abs(c):.2f}% "
-                             f"今{h.get('today_change_signals',0)}/昨{h.get('prev_change_signals',0)} "
-                             f"[{h.get('g1_tag','')}+{'/'.join(h.get('g2_tags',[]))}]")
+                             f"今{h.get('today_change_signals',0)} "
+                             f"[{h.get('g1_tag','')}]")
             lines.append("\n⚠ 僅供參考")
             send_telegram("\n".join(lines))
     except Exception as e:
@@ -2757,16 +2757,13 @@ def api_scan_condition_f():
 
 
 # ══════════════════════════════════════════════════════════
-# ▌ 條件 G：(UT或費波南)∧(日威廉/背離/MACD共振/週威廉) + 昨日回檔 + 變盤訊號<4
+# ▌ 條件 G（盤中買點，簡化版）：群1(UT或費波南) + 昨日回檔 + 今日突破數≥4=買點
 # ══════════════════════════════════════════════════════════
 def _g_signal_states(r):
-    """條件 G 第1點所需的各訊號狀態（沿用 A~F 既有門檻）。
-    common = A/B/C 共用的穩健門檻；ut/fib 為群1；wr/div 為群2 cache 可判定部分。"""
+    """條件 G 群1所需的訊號狀態（沿用 A~C 既有門檻）。
+    common = A/B/C 共用的穩健門檻；ut/fib 為群1（UT 或 費波南）。"""
     has_fib = bool(r.get("fib",{}).get("buy_signals"))
     has_ut  = bool(r.get("ut_buy"))
-    has_wr  = bool(r.get("wr",{}).get("buy_signals"))
-    div     = r.get("div",{})
-    has_div = bool(div.get("buy_signals")) or div.get("score",0) >= 2
     close=r.get("close",0); ma5=r.get("ma5",0); ma10=r.get("ma10",0)
     ma20=r.get("ma20",0); ma60=r.get("ma60",0)
     ut_trail=r.get("ut_trail",0); change_pct=r.get("change_pct",0)
@@ -2789,8 +2786,7 @@ def _g_signal_states(r):
         cluster=(max(ma_vals)-min(ma_vals))/min(ma_vals)*100
         ma_loose=(cluster>=2.5) or (r.get("vol_ratio",0)>=2.5 and change_pct>=2.0) or below_ma_yesterday
     common = ut_above_trail and not_falling and above_short_ma and vol_ratio_ok and rising_strong and ma_loose
-    return {"common":common, "ut":has_ut, "fib":has_fib and fib_above_ma,
-            "wr":has_wr, "div":has_div}
+    return {"common":common, "ut":has_ut, "fib":has_fib and fib_above_ma}
 
 
 def _change_signal_counts(sid, ex, today_close, prev_close):
@@ -2840,64 +2836,17 @@ def _change_signal_counts(sid, ex, today_close, prev_close):
     return prev_count, today_count
 
 
-def _weekly_change_signal_counts(sid, ex, today_close):
-    """回傳 (本周變盤訊號, 前一週變盤訊號)：把日線 resample 成週K 後，比照日線那套算變盤訊號。
-    本周突破者=今日即時收盤(today_close，盤中會動)、前一週突破者=上週收盤；
-    壓力區相對各自突破者往前取 1/2/3/(4或5)/8/13『週』；紅K(收≥開)阻力=開盤價、
-    黑K(收<開)阻力=(開+收)/2；突破=收盤 > 阻力(嚴格大於)；『4或5』任一突破算 1 個。
-    資料不足回 (None, None)。"""
-    try:
-        # 只回看到13週→需~15根週K≈75個交易日，抓6個月日K已足夠(不必2年)
-        df = fetch_history(sid, period="6mo", ex=ex)
-    except Exception:
-        return None, None
-    if df is None or len(df) < 75:
-        return None, None
-    try:
-        df = df.copy()
-        df.index = pd.to_datetime(df.index)
-        wdf = df.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min",
-                                          "Close":"last","Volume":"sum"}).dropna()
-    except Exception:
-        return None, None
-    if len(wdf) < 15:        # 前一週往前13週 → 需 index -15
-        return None, None
-    closes = wdf["Close"].values.astype(float)
-    opens  = wdf["Open"].values.astype(float)
-
-    def count(breaker, start_idx):
-        """start_idx：突破者『前一週』的負索引；壓力區第 k 週在 start_idx-(k-1)。"""
-        if breaker is None or breaker <= 0:
-            return None
-        def zone(k):
-            idx = start_idx - (k - 1)
-            o = opens[idx]; c = closes[idx]
-            return o if c >= o else (o + c) / 2.0
-        n = 0
-        for k in (1, 2, 3):
-            if breaker > zone(k): n += 1
-        if (breaker > zone(4)) or (breaker > zone(5)): n += 1
-        for k in (8, 13):
-            if breaker > zone(k): n += 1
-        return n
-
-    this_week = count(today_close, -2)   # 本周：前一根=前一週(index -2)起算
-    prev_week = count(closes[-2],  -3)   # 前一週：前一根(index -3)起算
-    return this_week, prev_week
-
 def scan_condition_g(cached, exclude_traditional=True):
-    """條件 G 掃描核心，回傳 (hits, candidate_count)。供 API route 與自動排程共用。
-    1. (UT∨費波南)∧(日威廉∨指標背離∨MACD共振∨週威廉)，各訊號沿用 A~F 既有門檻。
-    2. 1日前回檔：1日前收盤<近3日最高 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
-    3a.尚未起漲過濾：1日前收盤突破的變盤訊號 < 4（壓力K相對1日前往前1/2/3/(4或5)/8/13根）。
-    3b.今日突破數：以今日即時收盤為突破者，比相對今日1/2/3/(4或5)/8/13根壓力，≥4=買點。
-    4. 週變盤(比照日線改成週)：本周變盤訊號≥4 或 (本周==3 且 前一週≤3)。
-       本周突破者=今日即時收盤、前一週=上週收盤；壓力K往前1/2/3/(4或5)/8/13『週』。"""
+    """條件 G（盤中買點，簡化版）掃描核心，回傳 (hits, candidate_count)。供 API route 與自動排程共用。
+    1. 群1：UT 或 費波南（沿用 A~C 既有門檻，含 common 穩健門檻）。
+    2. 昨日回檔：1日前收盤<近3日最高 且 (1日前收盤≤1日前MA5 或 ≤1日前MA10)。
+    3. 今日突破數：以今日即時收盤為突破者，比相對今日 1/2/3/(4或5)/8/13 根壓力，≥4=買點⚡。
+       盤中即時價會變動，所以今日突破數會隨盤勢更新。"""
     def _ind_ok(sid):
         if not exclude_traditional: return True
         return not is_excluded_industry(industry_map.get(sid, ""))
 
-    # 先用最便宜的條件過濾：流動性 + 第2點回檔 + 第1點(共用門檻+群1)
+    # 過濾：流動性 + 昨日回檔 + 群1（common 穩健門檻 + UT/費波南）
     pool = []
     for r in cached:
         if r.get("volume",0) < 20: continue
@@ -2910,56 +2859,24 @@ def scan_condition_g(cached, exclude_traditional=True):
     if not pool:
         return [], 0
 
-    # MACD共振(E)命中集合（群2 來源之一；E 內含週MACD，7天cache）
-    try:
-        e_hits, _ = scan_condition_e(cached, exclude_traditional=exclude_traditional)
-        e_ids = {h.get("id") for h in e_hits}
-    except Exception:
-        e_ids = set()
-
     def check(item):
         r, st = item
         sid = r.get("id")
         ex  = next((s.get("ex","tse") for s in watchlist if s["id"]==sid), "tse")
-        # 群2：日威廉 / 指標背離 / MACD共振 / 週威廉（前三項用 cache，皆不滿足才抓週威廉）
-        g2 = []
-        if st["wr"]:     g2.append("日威廉")
-        if st["div"]:    g2.append("指標背離")
-        if sid in e_ids: g2.append("MACD共振")
-        wkw = None
-        if not g2:
-            wkw = _get_weekly_williams_state(sid, ex, preset="F")
-            if wkw.get("wave_complete"): g2.append("週威廉波浪")
-        if not g2: return None
-        # 第3點(日變盤)：1日前突破<4(尚未起漲) → 留下；今日突破數(盤中即時)→ ≥4=買點
-        prev_n, today_n = _change_signal_counts(sid, ex, r.get("close", 0), r.get("prev_close", 0))
-        if prev_n is None or prev_n >= 4: return None
+        # 今日突破數（盤中即時）：≥4=買點⚡
+        _, today_n = _change_signal_counts(sid, ex, r.get("close", 0), r.get("prev_close", 0))
         today_n = today_n if today_n is not None else 0
-        # 第4點(週變盤)：本周突破≥4 或 (本周==3 且 前一週≤3)
-        wk_now, wk_prev = _weekly_change_signal_counts(sid, ex, r.get("close", 0))
-        if wk_now is None: return None
-        weekly_ok = (wk_now >= 4) or (wk_now == 3 and wk_prev is not None and wk_prev <= 3)
-        if not weekly_ok: return None
         g1 = "UT" if st["ut"] else "費波南"
         r_out = dict(r)
         r_out["buy_mode"]             = "G"
-        r_out["prev_change_signals"]  = prev_n
         r_out["today_change_signals"] = today_n
-        r_out["week_change_signals"]      = wk_now
-        r_out["prev_week_change_signals"] = wk_prev if wk_prev is not None else 0
         r_out["buy_now"]              = today_n >= 4
         r_out["g1_tag"]               = g1
-        r_out["g2_tags"]              = g2
-        if wkw: r_out["weekly_wr"] = wkw
         r_out["buy_reasons"]    = [
             f"進場群1：{g1}",
-            f"進場群2：{'/'.join(g2)}",
-            "1日前回檔確認(昨收<近3日高且≤短均)",
-            f"1日前突破 {prev_n} 個(<4，尚未起漲)",
+            "昨日回檔確認(昨收<近3日高且≤短均)",
             (f"今日已突破 {today_n} 個（≥4 買點⚡）" if r_out["buy_now"]
              else f"今日已突破 {today_n} 個（等衝到≥4）"),
-            f"週變盤：本周 {wk_now} 個、前一週 {r_out['prev_week_change_signals']} 個"
-            + ("（本周≥4）" if wk_now >= 4 else "（本周3且前一週≤3）"),
         ]
         return r_out
 
@@ -2980,9 +2897,8 @@ def scan_condition_g(cached, exclude_traditional=True):
 
 @app.route("/api/scan/condition_g", methods=["GET"])
 def api_scan_condition_g():
-    """條件 G（盤中選股）：(UT或費波南)∧(日威廉/背離/MACD共振/週威廉) + 1日前回檔 +
-    1日前尚未起漲(日變盤<4) + 週變盤(本周≥4 或 本周3且前一週≤3)，並回傳今日即時突破數(≥4=買點)。
-    盤中即時價會變動，所以今日/本周突破數會隨盤勢更新。第一次慢、之後 7 天 cache。"""
+    """條件 G（盤中買點，簡化版）：群1(UT或費波南) + 昨日回檔 + 今日即時突破數(≥4=買點⚡)。
+    盤中即時價會變動，所以今日突破數會隨盤勢更新。第一次慢、之後 7 天 cache。"""
     exclude_traditional = request.args.get("exclude_traditional","1") != "0"
     with cache_lock: cached = list(cache.values())
     if not cached:
@@ -3270,17 +3186,16 @@ def api_export_csv():
             headers={"Content-Disposition": f"attachment; filename=scan_F_{ts}.csv"})
 
     if mode == "G":
-        # 條件 G 專屬（盤中買點視角）：今日突破數(≥4=買點) + 1日前突破數(尚未起漲) + 進場群
+        # 條件 G 專屬（盤中買點視角）：今日突破數(≥4=買點) + 進場群1 + 昨日回檔數據
         w.writerow(["#","股號","名稱","現價","漲跌幅%","量比",
-                    "今日突破數","1日前突破數","本周突破數","前一週突破數","買點⚡",
-                    "進場群1","進場群2","昨收","近3日高","昨MA5","昨MA10","MA20","MA60"])
+                    "今日突破數","買點⚡","進場群1",
+                    "昨收","近3日高","昨MA5","昨MA10","MA20","MA60"])
         for i, r in enumerate(rows, 1):
             w.writerow([i, r.get("id",""), r.get("name",""),
                         r.get("close",0), r.get("change_pct",0), r.get("vol_ratio",0),
-                        r.get("today_change_signals",""), r.get("prev_change_signals",""),
-                        r.get("week_change_signals",""), r.get("prev_week_change_signals",""),
+                        r.get("today_change_signals",""),
                         "是" if r.get("buy_now") else "",
-                        r.get("g1_tag",""), "/".join(r.get("g2_tags", [])),
+                        r.get("g1_tag",""),
                         r.get("prev_close",0), r.get("prev3_high",0),
                         r.get("prev_ma5",0), r.get("prev_ma10",0),
                         r.get("ma20",0), r.get("ma60",0)])
