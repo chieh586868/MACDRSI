@@ -1542,6 +1542,9 @@ body{background:#000;color:#e0e0e0;font-family:'Microsoft JhengHei','微軟正�
 
 <div class="scan-bar">
   <div class="filter-row">
+    <button class="btn-day"  id="btn-day"  onclick="startScan('daily')">🔵 日K背離</button>
+    <button class="btn-week" id="btn-week" onclick="startScan('weekly')">🟣 週K背離</button>
+    <button class="btn-kd"   id="btn-kd"   onclick="startScan('kd')">🟢 KD背離</button>
     <button class="btn-condA" id="btn-condA" onclick="startCondScan('A')">🟠 條件A</button>
     <button class="btn-condB" id="btn-condB" onclick="startCondScan('B')">🔵 條件B</button>
     <button class="btn-condC" id="btn-condC" onclick="startCondScan('C')">🟢 條件C</button>
@@ -1649,8 +1652,10 @@ function excludeParam() {
 }
 
 function startScan(mode) {
-  const type  = document.getElementById('sel-type').value;
-  const score = document.getElementById('sel-score').value;
+  const typeEl  = document.getElementById('sel-type');
+  const scoreEl = document.getElementById('sel-score');
+  const type  = typeEl  ? typeEl.value  : 'all';
+  const score = scoreEl ? scoreEl.value : 2;
   scanMode = mode;
   setBtns(true);
   document.getElementById('stats-bar').style.display = 'none';
