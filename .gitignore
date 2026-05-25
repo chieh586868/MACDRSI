@@ -7,3 +7,11 @@ hist_cache.pkl
 tw_stocks.json
 delisted_cache.json
 industry_map.json
+
+# 敏感資料（金鑰/密碼/token）— 只存本機，絕不 commit
+config.py
+telegram_config.txt
+.env
+*.key
+secrets.json
+credentials.json

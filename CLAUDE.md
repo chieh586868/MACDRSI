@@ -15,6 +15,7 @@
 ## 開發約定（重要）
 - MACD/RSI 盤中選股系統**一律只改 `macd_app.py`**。
 - **不要修改 `app_optimized.py`**（保留但不使用；目前不在本 repo 內）。
+- **資安：絕不 commit `config.py`、`telegram_config.txt`，或任何含 `api_key` / `secret_key` / `password` / `token` 的檔案。** 敏感資料只存本機 `config.py` 與 `telegram_config.txt`（皆已列入 `.gitignore`）。`macd_app.py` 以 `from config import ...` 與環境變數讀取金鑰，不得硬寫。
 
 ## 選股邏輯（目前設定）
 
