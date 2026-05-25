@@ -863,7 +863,7 @@ def run_scan(mode="daily", min_score=2, div_type="all", exclude_traditional=Fals
     scan_progress["running"] = False
     results.sort(key=lambda x: (-x["div_score"], -x.get("change_pct", 0)))
     print(f"  ✅ {label}背離完成：{len(results)} 支，{elapsed} 秒")
-    return results, elapsed
+    return results, total, elapsed
 
 
 # ── 日週雙重背離 ──────────────────────────────────────────
@@ -1006,7 +1006,7 @@ def run_dw_scan(mode="triple", min_weekly=2, exclude_traditional=False):
         -x["change_pct"],
     ))
     print(f"  ✅ {label}完成：{len(results)} 支，{elapsed} 秒")
-    return results, elapsed
+    return results, total, elapsed
 
 
 # ── API ───────────────────────────────────────────────────
@@ -1017,14 +1017,14 @@ def api_scan():
     div_type  = request.args.get("type", "all")
     exclude   = request.args.get("exclude_traditional", "1") != "0"
     try:
-        results, elapsed = run_scan(mode=mode, min_score=min_score, div_type=div_type,
-                                    exclude_traditional=exclude)
+        results, n_scanned, elapsed = run_scan(mode=mode, min_score=min_score,
+                                                div_type=div_type, exclude_traditional=exclude)
         reg_cnt = sum(1 for r in results if r["regular_count"] > 0)
         hid_cnt = sum(1 for r in results if r["hidden_count"]  > 0)
         multi   = sum(1 for r in results if r["div_score"] >= 4)
         return jsonify(sanitize({
             "data":           results,
-            "total_scanned":  len(watchlist),
+            "total_scanned":  n_scanned,
             "hit_count":      len(results),
             "regular_count":  reg_cnt,
             "hidden_count":   hid_cnt,
@@ -1043,14 +1043,14 @@ def api_scan_dw():
     mode = request.args.get("mode", "triple")
     exclude = request.args.get("exclude_traditional", "1") != "0"
     try:
-        results, elapsed = run_dw_scan(mode=mode, exclude_traditional=exclude)
+        results, n_scanned, elapsed = run_dw_scan(mode=mode, exclude_traditional=exclude)
         best   = sum(1 for r in results if r["is_best"])
         strong = sum(1 for r in results if r["strong_resonance"])
         w_macd = sum(1 for r in results if r["weekly_macd_bull"])
         w_kd   = sum(1 for r in results if r["weekly_kd_cross"])
         return jsonify(sanitize({
             "data":             results,
-            "total_scanned":    len(watchlist),
+            "total_scanned":    n_scanned,
             "hit_count":        len(results),
             "best_count":       best,
             "strong_count":     strong,
@@ -1304,7 +1304,7 @@ def run_cond_scan(cond, exclude_traditional=False):
         rows = _cond_listing(cond)
         _save_cond_tables()
     print(f"  ✅ 條件 {cond} 完成：今日 {len(hits)} 支、表內共 {len(rows)} 支，{elapsed} 秒")
-    return rows, len(hits), elapsed
+    return rows, len(hits), total, elapsed
 
 
 @app.route("/api/cond/<cond>/scan", methods=["GET"])
@@ -1314,11 +1314,11 @@ def api_cond_scan(cond):
         return jsonify({"error": "未知條件，僅支援 A/B/C", "data": []}), 400
     exclude = request.args.get("exclude_traditional", "1") != "0"
     try:
-        rows, today_n, elapsed = run_cond_scan(cond, exclude_traditional=exclude)
+        rows, today_n, n_scanned, elapsed = run_cond_scan(cond, exclude_traditional=exclude)
         return jsonify(sanitize({
             "data": rows, "cond": cond,
             "today_hits": today_n, "table_count": len(rows),
-            "total_scanned": len(watchlist), "elapsed": elapsed,
+            "total_scanned": n_scanned, "elapsed": elapsed,
             "keep_days": COND_KEEP_DAYS,
             "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }))
