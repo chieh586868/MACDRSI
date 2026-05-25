@@ -6,3 +6,4 @@ cond_tables.json
 hist_cache.pkl
 tw_stocks.json
 delisted_cache.json
+industry_map.json
