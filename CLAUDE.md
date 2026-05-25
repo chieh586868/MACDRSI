@@ -12,6 +12,10 @@
   - `python macd_app.py` → http://localhost:5000（MACD/RSI 盤中選股，條件 A~G）
   - `python divergence_screener.py` → http://localhost:5001（指標背離選股，條件 A/B/C + 三指標/日週雙重/共振）
 
+## 開發約定（重要）
+- MACD/RSI 盤中選股系統**一律只改 `macd_app.py`**。
+- **不要修改 `app_optimized.py`**（保留但不使用；目前不在本 repo 內）。
+
 ## 選股邏輯（目前設定）
 
 ### macd_app.py（盤中選股，條件 A~G）
