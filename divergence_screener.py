@@ -1280,6 +1280,25 @@ body{background:#000;color:#e0e0e0;font-family:'Microsoft JhengHei','微軟正�
 .btn-day:hover,.btn-week:hover,.btn-kd:hover,.btn-triple:hover,.btn-resonance:hover{transform:translateY(-1px)}
 .btn-day:disabled,.btn-week:disabled,.btn-kd:disabled,.btn-triple:disabled,.btn-resonance:disabled{opacity:.4;cursor:not-allowed;transform:none}
 
+.btn-condA,.btn-condB,.btn-condC{padding:10px 22px;font-size:15px;font-weight:700;
+  border:none;border-radius:6px;cursor:pointer;transition:all .2s;color:#fff;letter-spacing:1px}
+.btn-condA{background:linear-gradient(135deg,#E65100,#FB8C00);box-shadow:0 2px 12px rgba(230,81,0,.4)}
+.btn-condB{background:linear-gradient(135deg,#0D47A1,#1E88E5);box-shadow:0 2px 12px rgba(13,71,161,.4)}
+.btn-condC{background:linear-gradient(135deg,#1B5E20,#43A047);box-shadow:0 2px 12px rgba(27,94,32,.4)}
+.btn-condA:hover,.btn-condB:hover,.btn-condC:hover{transform:translateY(-1px)}
+.btn-condA:disabled,.btn-condB:disabled,.btn-condC:disabled{opacity:.4;cursor:not-allowed;transform:none}
+
+.cond-tbl{width:100%;border-collapse:collapse}
+.cond-tbl th{position:sticky;top:57px;background:#0a1428;color:#5a8ab0;font-size:12px;
+  text-align:left;padding:10px 12px;border-bottom:2px solid #1a3a5c;white-space:nowrap;z-index:5}
+.cond-tbl td{padding:12px;border-bottom:1px solid #0f1520;white-space:nowrap;vertical-align:middle}
+.cond-tbl tr:hover td{background:#0a1428}
+.cond-tag{display:inline-block;font-size:11px;padding:2px 7px;border-radius:3px;margin:1px;
+  background:rgba(206,147,216,.18);color:#E1BEE7;white-space:nowrap}
+.del-btn{padding:5px 12px;font-size:12px;font-weight:600;border:1px solid rgba(239,83,80,.5);
+  border-radius:5px;background:transparent;color:#EF9A9A;cursor:pointer;transition:all .15s}
+.del-btn:hover{background:rgba(239,83,80,.2);border-color:#EF5350;color:#fff}
+
 .btn-export{padding:8px 16px;font-size:13px;background:transparent;
   border:1px solid rgba(255,255,255,.15);color:#7c8fa8;border-radius:5px;cursor:pointer}
 .btn-export:hover{border-color:#a5d6a7;color:#a5d6a7}
@@ -1402,6 +1421,9 @@ body{background:#000;color:#e0e0e0;font-family:'Microsoft JhengHei','微軟正�
 
 <div class="scan-bar">
   <div class="filter-row">
+    <button class="btn-condA" id="btn-condA" onclick="startCondScan('A')">🟠 條件A</button>
+    <button class="btn-condB" id="btn-condB" onclick="startCondScan('B')">🔵 條件B</button>
+    <button class="btn-condC" id="btn-condC" onclick="startCondScan('C')">🟢 條件C</button>
     <button class="btn-triple"    id="btn-triple"    onclick="startDWScan('triple')">🔴 三指標+日週雙重</button>
     <button class="btn-resonance" id="btn-resonance" onclick="startDWScan('resonance')">🔮 日週強烈共振</button>
     <button class="btn-export" onclick="exportCSV()">📥 匯出CSV</button>
@@ -1490,7 +1512,7 @@ fetch('/api/status').then(r=>r.json()).then(d=>{
 }).catch(()=>{});
 
 function setBtns(disabled) {
-  ['btn-day','btn-week','btn-kd','btn-triple','btn-resonance'].forEach(id => {
+  ['btn-day','btn-week','btn-kd','btn-triple','btn-resonance','btn-condA','btn-condB','btn-condC'].forEach(id => {
     const el = document.getElementById(id); if (el) el.disabled = disabled;
   });
 }
@@ -1814,6 +1836,128 @@ function showViewBar() {
     bar.style.display = 'flex';
     viewFilter('all');
   }
+}
+
+// ── 條件 A/B/C：7天累積表格 + 刪除 ──────────────────────
+const COND_NAMES = {
+  A: '條件A（三指標／日週雙重／日週共振）',
+  B: '條件B（週威廉波浪 + 日週MACD共振）',
+  C: '條件C（週威廉波浪 + 日威廉波浪）'
+};
+
+function startCondScan(cond) {
+  setBtns(true);
+  scanMode = 'cond' + cond;
+  const label = COND_NAMES[cond] || ('條件' + cond);
+  document.getElementById('stats-bar').style.display = 'none';
+  document.getElementById('tbl-head').style.display  = 'none';
+  document.getElementById('view-bar').style.display  = 'none';
+  document.getElementById('scan-info').textContent = '';
+  document.getElementById('prog').style.width = '0%';
+  document.getElementById('mode-bar').innerHTML =
+    `<span class="mode-tag" style="background:rgba(255,138,0,.18);color:#FFB74D;border:1px solid #FB8C00">● ${label} 掃描中...</span>`;
+  document.getElementById('tbl-body').innerHTML =
+    `<div class="empty"><span class="empty-icon" style="animation:blink 1s infinite">🗂️</span>
+     <div class="empty-title" style="color:#FFB74D">${label} 掃描中...（第一次較慢，要補一年資料）</div>
+     <div class="empty-sub" id="prog-txt">0 / 0 (0%)</div></div>`;
+
+  clearInterval(progTimer);
+  progTimer = setInterval(() => {
+    fetch('/api/progress').then(r=>r.json()).then(d=>{
+      if (d.total > 0) {
+        const pct = Math.round(d.done / d.total * 100);
+        document.getElementById('prog').style.width = pct + '%';
+        const pt = document.getElementById('prog-txt');
+        if (pt) pt.textContent = `${d.done} / ${d.total} (${pct}%)`;
+        document.getElementById('scan-info').textContent = `${d.done}/${d.total}`;
+        if (!d.running) clearInterval(progTimer);
+      }
+    }).catch(()=>{});
+  }, 700);
+
+  fetch(`/api/cond/${cond}/scan`)
+    .then(r => r.json())
+    .then(data => {
+      clearInterval(progTimer);
+      document.getElementById('prog').style.width = '100%';
+      setTimeout(() => document.getElementById('prog').style.width = '0%', 1500);
+      if (data.error) throw new Error(data.error);
+      allData = data.data || [];
+      document.getElementById('mode-bar').innerHTML =
+        `<span class="mode-tag" style="background:rgba(255,138,0,.18);color:#FFB74D;border:1px solid #FB8C00">${label}</span>
+         <span style="color:#3d5060;font-size:12px">
+           共掃描 ${data.total_scanned} 支 · 今日命中 ${data.today_hits} 支 ·
+           表內累積 ${data.table_count} 支（保留 ${data.keep_days} 天）· 耗時 ${data.elapsed} 秒
+         </span>`;
+      document.getElementById('scan-info').textContent =
+        `✓ 今日 ${data.today_hits} · 表內 ${data.table_count} · ${data.elapsed}秒`;
+      renderCondTable(allData, cond);
+      setBtns(false);
+    })
+    .catch(e => {
+      clearInterval(progTimer);
+      document.getElementById('tbl-body').innerHTML =
+        `<div class="empty"><span class="empty-icon">⚠</span>
+         <div style="color:#ef5350">掃描失敗：${e.message}</div></div>`;
+      document.getElementById('mode-bar').innerHTML =
+        '<span class="mode-none" style="color:#ef5350">掃描失敗</span>';
+      setBtns(false);
+    });
+}
+
+function renderCondTable(rows, cond) {
+  document.getElementById('tbl-head').style.display = 'none';
+  if (!rows || rows.length === 0) {
+    document.getElementById('tbl-body').innerHTML =
+      `<div class="empty"><span class="empty-icon">🗂️</span>
+       <div class="empty-title">條件${cond} 的 7 天表格目前是空的</div>
+       <div class="empty-sub">今日沒有命中，過去 7 天也沒有累積（或都被刪除了）</div></div>`;
+    return;
+  }
+  const body = rows.map((r, i) => {
+    const up = (r.change_pct||0) > 0, zero = (r.change_pct||0) === 0;
+    const cls = zero ? 'chg-zero' : (up ? 'chg-up' : 'chg-dn');
+    const chgStr = (up?'▲':zero?'─':'▼') + ' ' + Math.abs(r.change||0).toFixed(2);
+    const pctStr = (up?'+':'') + (r.change_pct||0).toFixed(2) + '%';
+    const tags = (r.tags||[]).map(t => `<span class="cond-tag">${t}</span>`).join(' ');
+    return `<tr>
+      <td style="color:#4a6080;font-family:monospace">${i+1}</td>
+      <td><span class="stock-id" style="font-size:17px">${r.id}　${r.name}</span></td>
+      <td><span class="price" style="font-size:18px">${(r.close||0).toFixed(2)}</span></td>
+      <td><span class="${cls}" style="font-size:16px">${chgStr}</span></td>
+      <td><span class="${cls}" style="font-size:16px">${pctStr}</span></td>
+      <td style="font-family:monospace;color:#fff">${r.vol_ratio||0}x</td>
+      <td>${tags || '─'}</td>
+      <td style="font-family:monospace;color:#7c8fa8;font-size:12px">${r.first_seen||''}</td>
+      <td style="font-family:monospace;color:#9bb3cc;font-size:12px">${r.last_seen||''}</td>
+      <td><button class="del-btn" onclick="deleteCond('${cond}','${r.id}')">🗑 刪除</button></td>
+    </tr>`;
+  }).join('');
+  document.getElementById('tbl-body').innerHTML =
+    `<table class="cond-tbl">
+       <thead><tr>
+         <th>#</th><th>股票</th><th>現價</th><th>漲跌</th><th>漲幅%</th><th>量比</th>
+         <th>符合條件</th><th>首次入表</th><th>最後出現</th><th>操作</th>
+       </tr></thead>
+       <tbody>${body}</tbody>
+     </table>`;
+}
+
+function deleteCond(cond, id) {
+  if (!confirm(`確定要從條件${cond}的表格刪除 ${id} 嗎？`)) return;
+  fetch(`/api/cond/${cond}/delete`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: id})
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) throw new Error(data.error);
+      allData = data.data || [];
+      document.getElementById('scan-info').textContent = `表內 ${data.table_count} 支`;
+      renderCondTable(allData, cond);
+    })
+    .catch(e => alert('刪除失敗：' + e.message));
 }
 
 function exportCSV() {
